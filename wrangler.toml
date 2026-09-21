@@ -15,7 +15,7 @@ id = "4e2d56caaddc44ac958c3c229a43e164"
 
 # ── Cron: dispatcher tick (Phase 3) ──
 [triggers]
-crons = ["*/1 * * * *"]  # every 1 min; dispatcher enforces the real 45s pacing internally
+crons = ["*/1 * * * *"]  # every 1 min; dispatcher pops exactly 1 queued row/tick = ~60s natural pacing
 
 # Secrets (set via `wrangler secret put`, NOT here):
 #   TG_BOT_TOKEN        - Telegram Bot API token

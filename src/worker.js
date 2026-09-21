@@ -21,9 +21,75 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // TODO Phase 3: dispatcher tick — pop oldest queued row, trigger GitHub workflow_dispatch
+    await dispatchNextQueuedJoin(env);
   },
 };
+
+const GITHUB_REPO = "ccorryxx-bot/gp-join-automation";
+
+// Cron fires every 1 min (Cloudflare's minimum granularity) and this processes
+// exactly ONE queued row per tick — that alone gives ~60s natural pacing
+// between joins, which is more conservative than the 45s target in the roadmap.
+// No internal sleep/loop needed.
+async function dispatchNextQueuedJoin(env) {
+  const row = await env.DB.prepare(
+    "SELECT id, url_normalized FROM join_queue WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1"
+  ).first();
+
+  if (!row) return; // nothing queued — no-op tick
+
+  const joinUrl = denormalizeToJoinUrl(row.url_normalized);
+  if (!joinUrl) {
+    // Shouldn't happen given normalizeTelegramInviteUrl's output format, but guard anyway.
+    await env.DB.prepare(
+      "UPDATE join_queue SET status = 'failed', detail = ?, updated_at = ? WHERE id = ?"
+    ).bind("denormalize_failed", Date.now(), row.id).run();
+    return;
+  }
+
+  const dispatchRes = await fetch(
+    `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/join.yml/dispatches`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.GH_PAT}`,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "gp-join-automation-dispatcher",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        ref: "main",
+        inputs: { group_url: joinUrl, queue_id: String(row.id) },
+      }),
+    }
+  );
+
+  if (dispatchRes.status === 204) {
+    // GitHub returns 204 No Content on a successful dispatch.
+    await env.DB.prepare(
+      "UPDATE join_queue SET status = 'triggered', updated_at = ? WHERE id = ?"
+    ).bind(Date.now(), row.id).run();
+  } else {
+    console.error("workflow_dispatch failed:", dispatchRes.status, await dispatchRes.text());
+    // Leave status = 'queued' — next tick retries automatically. No change needed here.
+  }
+  // KNOWN LIMITATION (tracked for Phase 5): if the Action itself crashes before
+  // calling /report, this row stays stuck at 'triggered' forever. Phase 5's
+  // /report endpoint closes this loop; a stale-row timeout sweep is a
+  // reasonable future addition but out of scope for now.
+}
+
+// Inverse of normalizeTelegramInviteUrl — deterministic, so no raw-URL column needed.
+function denormalizeToJoinUrl(normalized) {
+  if (normalized.startsWith("invite:")) {
+    return `https://t.me/+${normalized.slice("invite:".length)}`;
+  }
+  if (normalized.startsWith("username:")) {
+    return `https://t.me/${normalized.slice("username:".length)}`;
+  }
+  return null;
+}
 
 async function handleTelegramWebhook(request, env, ctx) {
   const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
