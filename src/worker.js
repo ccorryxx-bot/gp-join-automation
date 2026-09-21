@@ -2,9 +2,10 @@
 // Phase 2: webhook-handler (dedup + enqueue + instant-ack)
 // Phase 3: dispatcher (Cron Trigger -> GitHub workflow_dispatch)
 // Phase 4: join.yml Telethon join logic — see scripts/join_telegram.py
-// Phase 5: /report endpoint                                       [TODO]
+// Phase 5: /report endpoint (join_queue update + processed_urls sync + user notify)
 
 const KV_DEDUP_TTL_SECONDS = 600; // 10 min — covers Telegram's webhook retry window
+const REPORT_STATUSES = new Set(["joined", "already_member", "failed"]);
 
 export default {
   async fetch(request, env, ctx) {
@@ -15,7 +16,7 @@ export default {
     }
 
     if (url.pathname === "/report") {
-      return new Response("not implemented yet", { status: 501 });
+      return handleReport(request, env);
     }
 
     return handleTelegramWebhook(request, env, ctx);
@@ -75,10 +76,11 @@ async function dispatchNextQueuedJoin(env) {
     console.error("workflow_dispatch failed:", dispatchRes.status, await dispatchRes.text());
     // Leave status = 'queued' — next tick retries automatically. No change needed here.
   }
-  // KNOWN LIMITATION (tracked for Phase 5): if the Action itself crashes before
-  // calling /report, this row stays stuck at 'triggered' forever. Phase 5's
-  // /report endpoint closes this loop; a stale-row timeout sweep is a
-  // reasonable future addition but out of scope for now.
+  // Once the Action finishes, it calls POST /report (see handleReport below)
+  // to move this row out of 'triggered' into a terminal status. If the Action
+  // crashes before calling /report, the row stays stuck at 'triggered' —
+  // a stale-row timeout sweep is a reasonable future addition but out of
+  // scope for now.
 }
 
 // Inverse of normalizeTelegramInviteUrl — deterministic, so no raw-URL column needed.
@@ -90,6 +92,64 @@ function denormalizeToJoinUrl(normalized) {
     return `https://t.me/${normalized.slice("username:".length)}`;
   }
   return null;
+}
+
+// Phase 5: called by scripts/join_telegram.py after the Action attempts a join.
+// Body: { queue_id, status: "joined"|"already_member"|"failed", detail? }
+async function handleReport(request, env) {
+  const incomingSecret = request.headers.get("X-Report-Secret");
+  if (!env.REPORT_SECRET || incomingSecret !== env.REPORT_SECRET) {
+    return new Response("forbidden", { status: 403 });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("bad request", { status: 400 });
+  }
+
+  const id = Number(body?.queue_id);
+  const status = body?.status;
+  const detail = typeof body?.detail === "string" ? body.detail : "";
+
+  if (!Number.isInteger(id) || !REPORT_STATUSES.has(status)) {
+    return new Response("bad request", { status: 400 });
+  }
+
+  const row = await env.DB.prepare(
+    "SELECT chat_id, url_normalized, status AS current_status FROM join_queue WHERE id = ?"
+  ).bind(id).first();
+
+  if (!row) {
+    return new Response("not found", { status: 404 });
+  }
+
+  // Idempotent: a retried/duplicate /report call for an already-closed row
+  // is ack'd without re-updating state or re-notifying the user.
+  if (row.current_status !== "triggered") {
+    return new Response("OK", { status: 200 });
+  }
+
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB
+      .prepare("UPDATE join_queue SET status = ?, detail = ?, updated_at = ? WHERE id = ?")
+      .bind(status, detail, now, id),
+    env.DB
+      .prepare("UPDATE processed_urls SET last_status = ? WHERE url_normalized = ?")
+      .bind(status, row.url_normalized),
+  ]);
+
+  await replyToUser(env, row.chat_id, reportMessage(status, detail));
+
+  return new Response("OK", { status: 200 });
+}
+
+function reportMessage(status, detail) {
+  if (status === "joined") return "✅ Group ထဲ join ဝင်ပြီးပါပြီ";
+  if (status === "already_member") return "ℹ️ ဒီ group ထဲ join ဝင်ပြီးသားဖြစ်နေပါတယ်";
+  return `❌ Join မအောင်မြင်ပါ (${detail || "unknown error"})`;
 }
 
 async function handleTelegramWebhook(request, env, ctx) {

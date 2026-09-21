@@ -30,4 +30,5 @@ jobs:
           GROUP_URL: ${{ inputs.group_url }}
           QUEUE_ID: ${{ inputs.queue_id }}
           REPORT_URL: ${{ secrets.WORKER_REPORT_URL }}
+          REPORT_SECRET: ${{ secrets.REPORT_SECRET }}
         run: python scripts/join_telegram.py

@@ -6,13 +6,13 @@ Env vars (required):
   GROUP_URL, QUEUE_ID                        - passed from workflow_dispatch inputs
 
 Env vars (optional):
-  REPORT_URL - base URL of the Worker (e.g. https://gp-join-automation.<sub>.workers.dev).
-               If set, POSTs the result to {REPORT_URL}/report. That endpoint is
-               still a 501 stub until Phase 5, so failures to reach it are logged
-               and swallowed on purpose -- this script's job is only to join.
+  REPORT_URL, REPORT_SECRET - base URL of the Worker (e.g.
+               https://gp-join-automation.<sub>.workers.dev) and the shared
+               secret it expects on X-Report-Secret. If REPORT_URL is unset,
+               the report step is skipped entirely (useful for local testing).
 
 Exit code: 0 on joined/already_member, 1 on any failure (surfaces in the
-GitHub Actions run status even before Phase 5 closes the D1 loop).
+GitHub Actions run status; /report closes the D1 loop either way).
 """
 
 import json
@@ -43,6 +43,7 @@ SESSION_STRING = os.environ["TG_SESSION_STRING"]
 GROUP_URL = os.environ["GROUP_URL"]
 QUEUE_ID = os.environ["QUEUE_ID"]
 REPORT_URL = os.environ.get("REPORT_URL", "").rstrip("/")
+REPORT_SECRET = os.environ.get("REPORT_SECRET", "")
 
 # Short floods get auto-slept through; anything past this budget fails fast
 # instead of tying up the Actions runner (worst case: MAX_RETRIES sleeps).
@@ -71,13 +72,15 @@ def report(status: str, detail: str = ""):
         req = urllib.request.Request(
             f"{REPORT_URL}/report",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Report-Secret": REPORT_SECRET,
+            },
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10)
     except urllib.error.HTTPError as e:
-        # Expected 501 until Phase 5 ships /report -- not a script failure.
-        print(f"[report] callback returned {e.code} (expected pre-Phase-5)")
+        print(f"[report] callback returned {e.code}: {e.read().decode(errors='replace')}")
     except Exception as e:
         print(f"[report] callback skipped: {e}")
 

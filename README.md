@@ -19,7 +19,7 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 2 - webhook-handler Worker (dedup + enqueue)
 - [x] Phase 3 - dispatcher Worker (Cron + GitHub dispatch)
 - [x] Phase 4 - join.yml GitHub Action (Telethon join + FloodWait handling)
-- [ ] Phase 5 - /report endpoint + user notification
+- [x] Phase 5 - /report endpoint + user notification
 - [ ] Phase 6 - end-to-end test
 - [ ] Phase 7 - production cutover
 
@@ -29,6 +29,12 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 wrangler secret put TG_BOT_TOKEN
 wrangler secret put TG_WEBHOOK_SECRET
 wrangler secret put GH_PAT
+```
+
+## Secret to set before Phase 5 deploy (Cloudflare Worker)
+
+```
+wrangler secret put REPORT_SECRET   # shared with GitHub's REPORT_SECRET below — must match exactly
 ```
 
 ## Secrets to set before Phase 4 runs (GitHub repo secrets, not wrangler)
@@ -41,7 +47,8 @@ locally, log in once, print `StringSession.save(client.session)`) and add:
 gh secret set TG_API_ID            # from my.telegram.org
 gh secret set TG_API_HASH          # from my.telegram.org
 gh secret set TG_SESSION_STRING    # generated locally, never commit this
-gh secret set WORKER_REPORT_URL    # optional until Phase 5 — e.g. https://gp-join-automation.<sub>.workers.dev
+gh secret set WORKER_REPORT_URL    # e.g. https://gp-join-automation.<sub>.workers.dev
+gh secret set REPORT_SECRET        # must match Cloudflare's REPORT_SECRET exactly
 ```
 
 ## Deploy

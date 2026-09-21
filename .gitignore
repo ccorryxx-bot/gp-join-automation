@@ -3,3 +3,5 @@ node_modules/
 .env
 *.session
 *.session-journal
+__pycache__/
+*.pyc
