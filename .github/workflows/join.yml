@@ -12,7 +12,22 @@ on:
 jobs:
   join:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # TODO Phase 4: setup-python, pip install telethon, run join script
-      - run: echo "TODO Phase 4 - Telethon join logic for ${{ inputs.group_url }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install telethon
+
+      - name: Join Telegram group
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          GROUP_URL: ${{ inputs.group_url }}
+          QUEUE_ID: ${{ inputs.queue_id }}
+          REPORT_URL: ${{ secrets.WORKER_REPORT_URL }}
+        run: python scripts/join_telegram.py

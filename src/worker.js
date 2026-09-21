@@ -1,6 +1,7 @@
 // gp-join-automation — Cloudflare Worker
 // Phase 2: webhook-handler (dedup + enqueue + instant-ack)
-// Phase 3: dispatcher (Cron Trigger -> GitHub workflow_dispatch)  [TODO]
+// Phase 3: dispatcher (Cron Trigger -> GitHub workflow_dispatch)
+// Phase 4: join.yml Telethon join logic — see scripts/join_telegram.py
 // Phase 5: /report endpoint                                       [TODO]
 
 const KV_DEDUP_TTL_SECONDS = 600; // 10 min — covers Telegram's webhook retry window

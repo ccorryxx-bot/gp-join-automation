@@ -16,9 +16,9 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 ## Phase Status
 
 - [x] Phase 1 - repo + D1/KV resource creation
-- [ ] Phase 2 - webhook-handler Worker (dedup + enqueue)
-- [ ] Phase 3 - dispatcher Worker (Cron + GitHub dispatch)
-- [ ] Phase 4 - join.yml GitHub Action (Telethon join + FloodWait handling)
+- [x] Phase 2 - webhook-handler Worker (dedup + enqueue)
+- [x] Phase 3 - dispatcher Worker (Cron + GitHub dispatch)
+- [x] Phase 4 - join.yml GitHub Action (Telethon join + FloodWait handling)
 - [ ] Phase 5 - /report endpoint + user notification
 - [ ] Phase 6 - end-to-end test
 - [ ] Phase 7 - production cutover
@@ -29,6 +29,19 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 wrangler secret put TG_BOT_TOKEN
 wrangler secret put TG_WEBHOOK_SECRET
 wrangler secret put GH_PAT
+```
+
+## Secrets to set before Phase 4 runs (GitHub repo secrets, not wrangler)
+
+Needs a dedicated Telethon account (see Resources table — not yet created).
+Once it exists, generate a StringSession locally (one-off, `telethon` installed
+locally, log in once, print `StringSession.save(client.session)`) and add:
+
+```
+gh secret set TG_API_ID            # from my.telegram.org
+gh secret set TG_API_HASH          # from my.telegram.org
+gh secret set TG_SESSION_STRING    # generated locally, never commit this
+gh secret set WORKER_REPORT_URL    # optional until Phase 5 — e.g. https://gp-join-automation.<sub>.workers.dev
 ```
 
 ## Deploy
