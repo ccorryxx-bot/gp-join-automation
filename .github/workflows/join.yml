@@ -1,0 +1,18 @@
+name: gp-join
+on:
+  workflow_dispatch:
+    inputs:
+      group_url:
+        required: true
+        type: string
+      queue_id:
+        required: true
+        type: string
+
+jobs:
+  join:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO Phase 4: setup-python, pip install telethon, run join script
+      - run: echo "TODO Phase 4 - Telethon join logic for ${{ inputs.group_url }}"

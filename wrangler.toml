@@ -1,0 +1,23 @@
+name = "gp-join-automation"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+# ── D1: queue + dedup history ──
+[[d1_databases]]
+binding = "DB"
+database_name = "gp-join-queue-db"
+database_id = "23e72f68-d0b7-40ed-aa38-85b8ddd2a760"
+
+# ── KV: Telegram update_id short-TTL dedup ──
+[[kv_namespaces]]
+binding = "DEDUP_KV"
+id = "4e2d56caaddc44ac958c3c229a43e164"
+
+# ── Cron: dispatcher tick (Phase 3) ──
+[triggers]
+crons = ["*/1 * * * *"]  # every 1 min; dispatcher enforces the real 45s pacing internally
+
+# Secrets (set via `wrangler secret put`, NOT here):
+#   TG_BOT_TOKEN        - Telegram Bot API token
+#   TG_WEBHOOK_SECRET   - secret_token for webhook spoof protection
+#   GH_PAT              - GitHub PAT with `workflow` scope (repo dispatch trigger)
