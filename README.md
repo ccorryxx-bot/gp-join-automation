@@ -23,34 +23,29 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [ ] Phase 6 - end-to-end test
 - [ ] Phase 7 - production cutover
 
-## Secrets to set before Phase 2 deploy
+## Secrets
 
-```
-wrangler secret put TG_BOT_TOKEN
-wrangler secret put TG_WEBHOOK_SECRET
-wrangler secret put GH_PAT
-```
+### Cloudflare Worker (`wrangler secret put <name>`)
 
-## Secret to set before Phase 5 deploy (Cloudflare Worker)
+| Secret | Used by | Notes |
+|---|---|---|
+| `TG_BOT_TOKEN` | webhook-handler, /report notify | Telegram Bot API token |
+| `TG_WEBHOOK_SECRET` | webhook-handler | Telegram's `secret_token` for webhook spoof protection |
+| `GH_PAT` | dispatcher | needs `workflow` scope, triggers join.yml |
+| `REPORT_SECRET` | /report | must match GitHub's `REPORT_SECRET` exactly |
 
-```
-wrangler secret put REPORT_SECRET   # shared with GitHub's REPORT_SECRET below — must match exactly
-```
+### GitHub Actions repo secrets (`gh secret set <name>`)
 
-## Secrets to set before Phase 4 runs (GitHub repo secrets, not wrangler)
-
-Needs a dedicated Telethon account (see Resources table — not yet created).
-Once it exists, generate a StringSession locally (one-off, `telethon` installed
-locally, log in once, print `StringSession.save(client.session)`) and add:
-
-```
-gh secret set TG_API_ID            # from my.telegram.org
-gh secret set TG_API_HASH          # from my.telegram.org
-gh secret set TG_SESSION_STRING    # generated locally, never commit this
-gh secret set WORKER_REPORT_URL    # e.g. https://gp-join-automation.<sub>.workers.dev
-gh secret set REPORT_SECRET        # must match Cloudflare's REPORT_SECRET exactly
-```
+| Secret | Used by | Notes |
+|---|---|---|
+| `CLOUDFLARE_API_TOKEN` | deploy.yml | Cloudflare dashboard → My Profile → API Tokens → "Edit Cloudflare Workers" template |
+| `CLOUDFLARE_ACCOUNT_ID` | deploy.yml | Cloudflare dashboard sidebar, or `wrangler whoami` |
+| `TG_API_ID` | join.yml | from my.telegram.org |
+| `TG_API_HASH` | join.yml | from my.telegram.org |
+| `TG_SESSION_STRING` | join.yml | generated locally once, dedicated account (see Resources — not yet created), never commit |
+| `WORKER_REPORT_URL` | join.yml | Worker's deployed URL, e.g. `https://gp-join-automation.<sub>.workers.dev` |
+| `REPORT_SECRET` | join.yml | must match Cloudflare's `REPORT_SECRET` exactly |
 
 ## Deploy
 
-Via GitHub Actions CI (wrangler deploy) - not via MCP cf_worker_deploy (account-wide overwrite risk, see roadmap section 6).
+Via GitHub Actions CI (`.github/workflows/deploy.yml`, `wrangler deploy`) — not via MCP `cf_worker_deploy` (account-wide overwrite risk, see roadmap section 6). Push to `main` (or run the workflow manually) once `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` are set — the Worker itself has never been deployed yet.
