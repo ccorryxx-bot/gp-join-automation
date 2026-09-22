@@ -31,9 +31,12 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 | 2026-09-22 | Worker deploy via CI (`deploy.yml`) | ✅ success — live at the workers.dev URL above |
 | 2026-09-22 | D1 schema (`join_queue`, `processed_urls`) | ✅ applied directly against production D1, confirmed via `sqlite_master` query |
 | 2026-09-22 | Telegram `setWebhook` → Worker URL | ✅ confirmed live — sent `/start` to the bot, got back the "valid group link" rejection reply, proving webhook fired → Worker ran → `TG_BOT_TOKEN` reply succeeded |
-| 2026-09-22 | Real invite link → queued → dispatcher → Telethon join → `/report` → user notified (full loop) | ⏳ not yet tested — **next step** |
+| 2026-09-22 | Real invite link → queued → dispatcher → Telethon join → `/report` → user notified (full loop) | ❌ 5/5 attempts (id 1–5) ended `stale_no_report_timeout` — root-caused below, fix pushed, **re-test is next step** |
+| 2026-09-22 | Root cause of the 5 failures | ✅ two independent bugs, both confirmed against live data (not guessed): **(1)** `join_telegram.py` imported plain `telethon.TelegramClient` — no `await`/`telethon.sync`, so the join call built a coroutine and silently dropped it, never actually joining. **(2)** `/report` POSTs never reached Worker code — confirmed via direct D1 query, `debug_log` (written at the top of `handleReport()`, pre-auth) had **0 rows** across all 5 attempts, consistent with Cloudflare's Browser Integrity Check 403'ing `urllib`'s default `Python-urllib/3.x` User-Agent at the edge |
 
-**Next test step:** send an actual `t.me/...` or `t.me/+...` group invite link to the bot (not `/start`), confirm the "✅ Queued" reply, then watch the `join.yml` workflow run appear in the Actions tab within ~1 minute (cron dispatcher tick).
+**Fix applied:** `scripts/join_telegram.py` now uses `telethon.sync`, sends a browser-style `User-Agent` on the `/report` call, and treats a failed report as a job failure (`exit 1`) even if the join itself succeeded, so silent "green but user never told" runs can't happen again. `debug_log` table is being kept (not dropped yet) until a live re-test confirms the fix.
+
+**Next test step:** send a **new** `t.me/...` or `t.me/+...` group invite link to the bot (not `/start` — this would be attempt #6, first one against the fix), confirm the "✅ Queued" reply, then watch the `join.yml` run in the Actions tab within ~1 minute (cron dispatcher tick). Check `join_queue` for `status='joined'` (or `already_member`) instead of `stale_no_report_timeout`.
 
 ## Secrets
 
