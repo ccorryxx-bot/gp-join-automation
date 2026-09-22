@@ -8,23 +8,29 @@ on:
       queue_id:
         required: true
         type: string
+      account:
+        description: "Which Telethon account joins this group"
+        required: true
+        type: choice
+        options:
+          - CH
+          - JL
+        default: CH
 
 # Defense-in-depth alongside the Worker's own in-flight check
-# (dispatchNextQueuedJoin refuses to dispatch while a join_queue row is
-# 'triggered' in D1). That's app-level logic in a Worker; this is a
-# GitHub-enforced guarantee that catches what the Worker check can't --
-# e.g. someone manually re-running this workflow from the Actions tab while
-# an automated run triggered by the dispatcher is already going.
+# (dispatchNextQueuedJoinForAccount refuses to dispatch for an account while
+# one of its join_queue rows is 'triggered' in D1). That's app-level logic
+# in a Worker; this is a GitHub-enforced guarantee that catches what the
+# Worker check can't -- e.g. someone manually re-running this workflow from
+# the Actions tab while an automated run triggered by the dispatcher is
+# already going.
 #
-# Fixed group name (NOT per-queue_id) is deliberate: the whole point is that
-# every run of this workflow shares one lane, so at most one join is ever
-# actually executing no matter how many workflow_dispatch calls land. If a
-# second Telethon account is added later (see README's CH_/ACC2_ prefix
-# convention), split this into a per-account group instead -- e.g.
-# `group: telegram-join-${{ inputs.account_prefix }}` -- so two different
-# accounts can join in parallel without blocking each other unnecessarily.
+# Phase 7 (2026-09-22): per-account group, as this comment originally
+# predicted -- CH and JL each get their own lane, so a run for one account
+# is queued behind that SAME account's in-progress run, but never blocks
+# the other account from joining in parallel.
 concurrency:
-  group: telegram-join-CH
+  group: telegram-join-${{ inputs.account }}
   # NEVER true here. Cancelling an in-progress run mid-join can leave
   # Telethon in an inconsistent state -- e.g. ImportChatInviteRequest already
   # sent to Telegram but the process killed before the /report call fires --
@@ -50,9 +56,15 @@ jobs:
 
       - name: Join Telegram group
         env:
-          TG_API_ID: ${{ secrets.CH_TG_API_ID }}
-          TG_API_HASH: ${{ secrets.CH_TG_API_HASH }}
-          TG_SESSION_STRING: ${{ secrets.CH_TG_SESSION_STRING }}
+          # Phase 7: CH keeps its original secret names (TG_ in the middle,
+          # SESSION_STRING order) since those were already live; JL's names
+          # are whatever was set when the secrets were added
+          # (JL_API_ID / JL_API_HASH / JL_STRING_SESSION) -- this ternary
+          # just routes to the right set based on the account input.
+          TG_API_ID: ${{ inputs.account == 'JL' && secrets.JL_API_ID || secrets.CH_TG_API_ID }}
+          TG_API_HASH: ${{ inputs.account == 'JL' && secrets.JL_API_HASH || secrets.CH_TG_API_HASH }}
+          TG_SESSION_STRING: ${{ inputs.account == 'JL' && secrets.JL_STRING_SESSION || secrets.CH_TG_SESSION_STRING }}
+          ACCOUNT: ${{ inputs.account }}
           GROUP_URL: ${{ inputs.group_url }}
           QUEUE_ID: ${{ inputs.queue_id }}
           REPORT_URL: ${{ secrets.WORKER_REPORT_URL }}

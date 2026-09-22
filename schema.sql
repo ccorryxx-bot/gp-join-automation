@@ -1,26 +1,35 @@
 -- gp-join-queue-db schema
--- Applied directly via Cloudflare D1 on 2026-09-22 (see roadmap Phase 6 prep).
--- Kept here for version control / disaster recovery — re-apply with:
+-- Applied directly via Cloudflare D1 (see README Live Verification Log for
+-- dates). Kept here for version control / disaster recovery — re-apply
+-- against a FRESH database with:
 --   wrangler d1 execute gp-join-queue-db --remote --file=schema.sql
+-- NOTE: this file is the target end-state, not a migration script. The
+-- live DB was already populated when the Phase 7 columns were added, so
+-- that change was applied as ALTER/rebuild statements directly (see
+-- migrations/002_multi_account.sql) rather than by re-running this file.
 
 CREATE TABLE IF NOT EXISTS processed_urls (
-  url_normalized TEXT PRIMARY KEY,
+  url_normalized TEXT NOT NULL,
+  account        TEXT NOT NULL,  -- added 2026-09-22 (Phase 7): 'CH' / 'JL' —
+                                  -- same group tracked independently per account
   first_seen_at  INTEGER NOT NULL,
-  last_status    TEXT NOT NULL
+  last_status    TEXT NOT NULL,
+  PRIMARY KEY (url_normalized, account)
 );
 
 CREATE TABLE IF NOT EXISTS join_queue (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_id           TEXT NOT NULL,
   url_normalized    TEXT NOT NULL,
+  account           TEXT NOT NULL DEFAULT 'CH',  -- added 2026-09-22 (Phase 7)
   status            TEXT NOT NULL,
   detail            TEXT,
   created_at        INTEGER NOT NULL,
   updated_at        INTEGER,
-  dispatch_attempts INTEGER NOT NULL DEFAULT 0  -- added 2026-09-22: bounds GitHub-dispatch retries (see MAX_DISPATCH_ATTEMPTS)
+  dispatch_attempts INTEGER NOT NULL DEFAULT 0  -- bounds GitHub-dispatch retries (see MAX_DISPATCH_ATTEMPTS)
 );
 
-CREATE INDEX IF NOT EXISTS idx_join_queue_status ON join_queue(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_join_queue_account_status ON join_queue(account, status, created_at);
 
 -- TEMP (added 2026-09-22): captures every request that reaches /report,
 -- pass or fail, while debugging stale_no_report_timeout. Never stores the

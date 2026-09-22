@@ -3,9 +3,40 @@
 // Phase 3: dispatcher (Cron Trigger -> GitHub workflow_dispatch)
 // Phase 4: join.yml Telethon join logic — see scripts/join_telegram.py
 // Phase 5: /report endpoint (join_queue update + processed_urls sync + user notify)
+// Phase 7 (2026-09-22): multi-account (CH / JL) support — inline-keyboard
+// account picker before queueing, per-account dedup/dispatch/pacing so both
+// accounts can join in parallel without blocking each other, and admin-only
+// gating (ADMIN_TG_ID) on every command and message this bot accepts.
 
 const KV_DEDUP_TTL_SECONDS = 600; // 10 min — covers Telegram's webhook retry window
 const REPORT_STATUSES = new Set(["joined", "already_member", "failed"]);
+
+// Add a 3rd entry here (+ its GitHub secrets + join.yml choice option) to
+// extend to another Telethon account later — everything else in this file
+// (dedup, dispatch, pacing) is already generic over this list.
+const ACCOUNTS = ["CH", "JL"];
+
+// How long an account-selection prompt stays valid. If the admin doesn't tap
+// a button within this window, the pending URLs are dropped from KV and the
+// admin has to resend the link(s) — deliberately short so a stale prompt
+// tapped days later can't silently queue an old batch.
+const PENDING_SELECTION_TTL_SECONDS = 300; // 5 min
+
+function pendingSelectionKvKey(chatId) {
+  return `pending_urls:${chatId}`;
+}
+
+function dispatchPacingKvKey(account) {
+  return `dispatch:next_allowed_at:${account}`;
+}
+
+// Every message and callback this bot processes is gated on this single ID
+// — set as a plain (non-secret) `ADMIN_TG_ID` var in wrangler.toml. Anyone
+// else's messages are silently ignored (no reply at all), so the bot's
+// existence isn't confirmed to a stranger who stumbles onto it.
+function isAdmin(env, userId) {
+  return !!env.ADMIN_TG_ID && String(userId) === String(env.ADMIN_TG_ID);
+}
 
 // Phase 6: bulk-URL intake. A message can now carry a variable-length list
 // like "[https://t.me/a,https://t.me/b,https://t.me/c]" instead of exactly
@@ -20,7 +51,6 @@ const MAX_URLS_PER_MESSAGE = 50; // sanity cap, not a target batch size
 // (not D1) because it's ephemeral scheduling state, not queue data.
 const MIN_DISPATCH_DELAY_MS = 60 * 1000; // 1 min
 const MAX_DISPATCH_DELAY_MS = 3 * 60 * 1000; // 3 min
-const DISPATCH_PACING_KV_KEY = "dispatch:next_allowed_at";
 
 // PeerFloodError is Telegram's account-level anti-spam signal, not a
 // per-URL problem (see scripts/join_telegram.py). Telegram does not publish
@@ -46,9 +76,11 @@ function randomDispatchDelayMs() {
 // a much larger value for a PeerFlood pause. TTL is derived from delayMs
 // (with a buffer) rather than a fixed 600s -- a fixed short TTL would let a
 // 24h pause silently expire from KV after 10 minutes and defeat the pause.
-async function armDispatchPacingDelay(env, delayMs = randomDispatchDelayMs()) {
+// Keyed per-account (Phase 7) — a PeerFlood pause or normal cooldown on CH
+// must never block JL's independent queue, and vice versa.
+async function armDispatchPacingDelay(env, account, delayMs = randomDispatchDelayMs()) {
   const ttlSeconds = Math.max(60, Math.ceil(delayMs / 1000) + 300);
-  await env.DEDUP_KV.put(DISPATCH_PACING_KV_KEY, String(Date.now() + delayMs), {
+  await env.DEDUP_KV.put(dispatchPacingKvKey(account), String(Date.now() + delayMs), {
     expirationTtl: ttlSeconds,
   });
 }
@@ -91,33 +123,44 @@ const MAX_DISPATCH_ATTEMPTS = 3;
 // no answer at all.
 const STALE_TRIGGERED_TIMEOUT_MS = 15 * 60 * 1000; // 15 min
 
-// Cron fires every 1 min (Cloudflare's minimum granularity) and this processes
-// exactly ONE queued row per tick — that alone gives ~60s natural pacing
-// between joins, which is more conservative than the 45s target in the roadmap.
-// No internal sleep/loop needed.
+// Cron fires every 1 min (Cloudflare's minimum granularity). Phase 7: CH and
+// JL are fully independent lanes now, so each gets its own in-flight check,
+// pacing cooldown, and queued row — one account being paused (PeerFlood,
+// FloodWait, mid-join) never blocks the other from joining.
 async function dispatchNextQueuedJoin(env) {
-  // Guard 1: never dispatch a new join while one is already in flight. With
-  // bulk intake, several rows can be 'queued' at once — this is what turns
-  // "N queued" into "join them one at a time" instead of a burst.
-  const inFlight = await env.DB.prepare(
-    "SELECT id FROM join_queue WHERE status = 'triggered' LIMIT 1"
-  ).first();
-  if (inFlight) return; // previous join still running / awaiting /report
+  for (const account of ACCOUNTS) {
+    await dispatchNextQueuedJoinForAccount(env, account);
+  }
+}
 
-  // Guard 2: pacing delay between one join finishing and the next starting.
-  // Set by armDispatchPacingDelay() from handleReport/sweepStaleTriggered.
-  const nextAllowedRaw = await env.DEDUP_KV.get(DISPATCH_PACING_KV_KEY);
+// Processes exactly ONE queued row per tick, for ONE account — that alone
+// gives ~60s natural pacing between joins on that account, more conservative
+// than the 45s target in the roadmap. No internal sleep/loop needed.
+async function dispatchNextQueuedJoinForAccount(env, account) {
+  // Guard 1: never dispatch a new join for this account while one of its
+  // rows is already in flight. With bulk intake, several rows can be
+  // 'queued' at once — this is what turns "N queued" into "join them one at
+  // a time" instead of a burst.
+  const inFlight = await env.DB.prepare(
+    "SELECT id FROM join_queue WHERE account = ? AND status = 'triggered' LIMIT 1"
+  ).bind(account).first();
+  if (inFlight) return; // previous join on this account still running / awaiting /report
+
+  // Guard 2: pacing delay between one join finishing and the next starting
+  // on THIS account. Set by armDispatchPacingDelay() from
+  // handleReport/sweepStaleTriggered.
+  const nextAllowedRaw = await env.DEDUP_KV.get(dispatchPacingKvKey(account));
   const nextAllowedAt = nextAllowedRaw ? Number(nextAllowedRaw) : 0;
   if (Date.now() < nextAllowedAt) return; // still inside the 1-3 min cooldown
 
   const row = await env.DB.prepare(
-    "SELECT id, chat_id, url_normalized, dispatch_attempts FROM join_queue WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1"
-  ).first();
+    "SELECT id, chat_id, url_normalized, dispatch_attempts FROM join_queue WHERE account = ? AND status = 'queued' ORDER BY created_at ASC LIMIT 1"
+  ).bind(account).first();
 
-  // Nothing queued: this is the "no more URLs → workflow stops" case. No
-  // special state to reset — the moment a new URL arrives via the webhook
-  // it's inserted as 'queued' and the very next cron tick picks it up again.
-  if (!row) return; // nothing queued — no-op tick
+  // Nothing queued for this account: no special state to reset — the moment
+  // a new URL is confirmed via the account picker it's inserted as 'queued'
+  // and the very next cron tick picks it up again.
+  if (!row) return; // nothing queued for this account — no-op tick
 
   const joinUrl = denormalizeToJoinUrl(row.url_normalized);
   if (!joinUrl) {
@@ -145,7 +188,7 @@ async function dispatchNextQueuedJoin(env) {
         },
         body: JSON.stringify({
           ref: "main",
-          inputs: { group_url: joinUrl, queue_id: String(row.id) },
+          inputs: { group_url: joinUrl, queue_id: String(row.id), account },
         }),
       }
     );
@@ -161,14 +204,14 @@ async function dispatchNextQueuedJoin(env) {
     ).bind(Date.now(), row.id).run();
     // Immediate feedback — the user's last message was "✅ Queued" up to ~60s
     // ago; without this, the chat looks dead until the Action finishes.
-    await replyToUser(env, row.chat_id, "🔄 လုပ်ဆောင်နေပါပြီ — Group ထဲ join ဝင်ဖို့ ကြိုးစားနေပါတယ်...");
+    await replyToUser(env, row.chat_id, `🔄 [${account}] လုပ်ဆောင်နေပါပြီ — Group ထဲ join ဝင်ဖို့ ကြိုးစားနေပါတယ်...`);
     return;
   }
 
   if (dispatchRes) {
     dispatchErrText = `${dispatchRes.status} ${await dispatchRes.text()}`;
   }
-  console.error("workflow_dispatch failed:", dispatchErrText);
+  console.error(`workflow_dispatch failed [${account}]:`, dispatchErrText);
 
   const attempts = (row.dispatch_attempts || 0) + 1;
   if (attempts >= MAX_DISPATCH_ATTEMPTS) {
@@ -192,14 +235,14 @@ async function dispatchNextQueuedJoin(env) {
 async function sweepStaleTriggered(env) {
   const cutoff = Date.now() - STALE_TRIGGERED_TIMEOUT_MS;
   const { results } = await env.DB.prepare(
-    "SELECT id, chat_id FROM join_queue WHERE status = 'triggered' AND updated_at < ?"
+    "SELECT id, chat_id, account FROM join_queue WHERE status = 'triggered' AND updated_at < ?"
   ).bind(cutoff).all();
 
   for (const row of results) {
     await env.DB.prepare(
       "UPDATE join_queue SET status = 'failed', detail = 'stale_no_report_timeout', updated_at = ? WHERE id = ?"
     ).bind(Date.now(), row.id).run();
-    await armDispatchPacingDelay(env);
+    await armDispatchPacingDelay(env, row.account);
     await replyToUser(env, row.chat_id, reportMessage("failed", "stale_no_report_timeout"));
   }
 }
@@ -260,7 +303,7 @@ async function handleReport(request, env) {
   }
 
   const row = await env.DB.prepare(
-    "SELECT chat_id, url_normalized, status AS current_status FROM join_queue WHERE id = ?"
+    "SELECT chat_id, url_normalized, account, status AS current_status FROM join_queue WHERE id = ?"
   ).bind(id).first();
 
   if (!row) {
@@ -279,17 +322,18 @@ async function handleReport(request, env) {
       .prepare("UPDATE join_queue SET status = ?, detail = ?, updated_at = ? WHERE id = ?")
       .bind(status, detail, now, id),
     env.DB
-      .prepare("UPDATE processed_urls SET last_status = ? WHERE url_normalized = ?")
-      .bind(status, row.url_normalized),
+      .prepare("UPDATE processed_urls SET last_status = ? WHERE url_normalized = ? AND account = ?")
+      .bind(status, row.url_normalized, row.account),
   ]);
 
   // This join is now resolved (joined / already_member / failed) — start the
-  // cooldown before dispatchNextQueuedJoin is allowed to pick up the next
-  // queued URL, if any. Normally 1-3 min; PeerFlood is a signal about the
-  // ACCOUNT, not this one URL, so it pauses the whole queue much longer
-  // instead of the usual short inter-join gap.
+  // cooldown, scoped to THIS account, before dispatchNextQueuedJoinForAccount
+  // is allowed to pick up that account's next queued URL, if any. Normally
+  // 1-3 min; PeerFlood is a signal about the ACCOUNT, not this one URL, so it
+  // pauses that account's whole queue much longer — the other account is
+  // untouched.
   const isPeerFlood = detail === "peer_flood_detected";
-  await armDispatchPacingDelay(env, isPeerFlood ? peerFloodPauseMs(env) : undefined);
+  await armDispatchPacingDelay(env, row.account, isPeerFlood ? peerFloodPauseMs(env) : undefined);
 
   await replyToUser(env, row.chat_id, reportMessage(status, detail));
 
@@ -341,11 +385,7 @@ async function handleTelegramWebhook(request, env, ctx) {
     return new Response("OK", { status: 200 });
   }
 
-  const message = update.message ?? update.channel_post;
-  const chatId = message?.chat?.id;
-  const text = message?.text;
-
-  if (!update.update_id || !chatId || !text) {
+  if (!update.update_id) {
     return new Response("OK", { status: 200 });
   }
 
@@ -357,34 +397,71 @@ async function handleTelegramWebhook(request, env, ctx) {
     }
     await env.DEDUP_KV.put(dedupKey, "1", { expirationTtl: KV_DEDUP_TTL_SECONDS });
 
+    // Phase 7: account-picker button taps arrive as callback_query, not
+    // message — handled entirely separately (its own admin check inside).
+    if (update.callback_query) {
+      await handleCallbackQuery(env, update.callback_query);
+      return new Response("OK", { status: 200 });
+    }
+
+    const message = update.message ?? update.channel_post;
+    const chatId = message?.chat?.id;
+    const text = message?.text;
+    const senderId = message?.from?.id;
+
+    if (!chatId || !text) {
+      return new Response("OK", { status: 200 });
+    }
+
+    // Phase 7: admin-only bot. Anyone else's message is silently dropped —
+    // no reply at all, so the bot's presence isn't confirmed to a stranger.
+    if (!isAdmin(env, senderId)) {
+      return new Response("OK", { status: 200 });
+    }
+
+    if (text.startsWith("/")) {
+      await handleCommand(env, chatId, text);
+      return new Response("OK", { status: 200 });
+    }
+
     // Phase 6: message can be "[https://t.me/a,https://t.me/b,...]" (any
     // count) or still a single bare link — both flow through the same path.
-    // Every URL still lands as its own join_queue row; dispatchNextQueuedJoin
-    // is what enforces "one at a time, 1-3 min apart", not this handler.
+    // Phase 7: instead of queueing immediately, valid URLs are parked in KV
+    // and the admin is asked which account (CH / JL) should run them —
+    // enqueueOneUrl only runs after that choice comes back via callback_query.
     const rawEntries = extractUrlEntries(text);
     const seenInMessage = new Set();
-    const now = Date.now();
-    const tally = { queued: 0, retry_queued: 0, already_done: 0, in_progress: 0, invalid: 0 };
+    const normalizedList = [];
+    let invalidCount = 0;
 
     for (const rawEntry of rawEntries) {
       const normalized = normalizeTelegramInviteUrl(rawEntry);
       if (!normalized) {
-        tally.invalid++;
+        invalidCount++;
         continue;
       }
       // A pasted list can repeat a link by accident — dedupe within this one
       // message too, without a second DB round trip for the repeat.
-      if (seenInMessage.has(normalized)) {
-        tally.in_progress++;
-        continue;
-      }
+      if (seenInMessage.has(normalized)) continue;
       seenInMessage.add(normalized);
-
-      const outcome = await enqueueOneUrl(env, chatId, normalized, now);
-      tally[outcome]++;
+      normalizedList.push(normalized);
     }
 
-    await replyToUser(env, chatId, buildIntakeSummary(tally, rawEntries.length));
+    if (normalizedList.length === 0) {
+      await replyToUser(
+        env,
+        chatId,
+        "⚠️ Valid Telegram group link ပို့ပါ (t.me/... or t.me/+...)\nList ပို့ချင်ရင် [https://t.me/a,https://t.me/b] format သုံးပါ"
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    await env.DEDUP_KV.put(
+      pendingSelectionKvKey(chatId),
+      JSON.stringify({ urls: normalizedList, invalidCount }),
+      { expirationTtl: PENDING_SELECTION_TTL_SECONDS }
+    );
+    await sendAccountPrompt(env, chatId, normalizedList.length, invalidCount);
     return new Response("OK", { status: 200 });
   } catch (err) {
     console.error("webhook-handler error:", err);
@@ -392,24 +469,130 @@ async function handleTelegramWebhook(request, env, ctx) {
   }
 }
 
+// Phase 7: admin taps "CH" or "JL" on the prompt sent above. Pulls the
+// parked URL list back out of KV, enqueues each one tagged with the chosen
+// account, then edits the original prompt message to show the result
+// (rather than leaving stale buttons on screen or sending a 2nd message).
+async function handleCallbackQuery(env, cq) {
+  const senderId = cq.from?.id;
+  const chatId = cq.message?.chat?.id;
+  const messageId = cq.message?.message_id;
+  const data = cq.data || "";
+
+  if (!isAdmin(env, senderId)) {
+    await answerCallbackQuery(env, cq.id);
+    return;
+  }
+
+  if (!data.startsWith("acct:") || !chatId) {
+    await answerCallbackQuery(env, cq.id);
+    return;
+  }
+
+  const account = data.slice("acct:".length);
+  if (!ACCOUNTS.includes(account)) {
+    await answerCallbackQuery(env, cq.id, "⚠️ မသိတဲ့ account");
+    return;
+  }
+
+  const pendingRaw = await env.DEDUP_KV.get(pendingSelectionKvKey(chatId));
+  if (!pendingRaw) {
+    // Prompt expired (PENDING_SELECTION_TTL_SECONDS) or already used by a
+    // previous tap — nothing left to enqueue.
+    await answerCallbackQuery(env, cq.id, "⌛ Session ကုန်သွားပါပြီ — URL ပြန်ပို့ပါ", true);
+    return;
+  }
+  await env.DEDUP_KV.delete(pendingSelectionKvKey(chatId));
+
+  let pending;
+  try {
+    pending = JSON.parse(pendingRaw);
+  } catch {
+    await answerCallbackQuery(env, cq.id, "⚠️ Internal error");
+    return;
+  }
+
+  const { urls, invalidCount } = pending;
+  const now = Date.now();
+  const tally = { queued: 0, retry_queued: 0, already_done: 0, in_progress: 0, invalid: invalidCount || 0 };
+
+  for (const normalized of urls) {
+    const outcome = await enqueueOneUrl(env, chatId, normalized, now, account);
+    tally[outcome]++;
+  }
+
+  await answerCallbackQuery(env, cq.id, `✅ ${account} ရွေးပြီးပါပြီ`);
+
+  const summary = `Account: ${account}\n\n${buildIntakeSummary(tally, urls.length + (invalidCount || 0))}`;
+  if (messageId) {
+    await editMessageText(env, chatId, messageId, summary);
+  } else {
+    await replyToUser(env, chatId, summary);
+  }
+}
+
+const HELP_TEXT = [
+  "🤖 gp-join-automation",
+  "",
+  "Group link (တစ်ခု (သို့) [url,url,...] list) ပို့ပါ — ဘယ် account (CH / JL) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
+  "",
+  "/status — Queue status (account တစ်ခုချင်းစီ)",
+  "/help — ဒီ message ပြန်ပြရန်",
+].join("\n");
+
+async function handleCommand(env, chatId, text) {
+  const cmd = text.trim().split(/\s+/)[0].split("@")[0].toLowerCase();
+
+  if (cmd === "/status") {
+    await replyToUser(env, chatId, await buildStatusMessage(env));
+    return;
+  }
+  if (cmd === "/help" || cmd === "/start") {
+    await replyToUser(env, chatId, HELP_TEXT);
+    return;
+  }
+  await replyToUser(env, chatId, "❓ မသိတဲ့ command ပါ — /help လို့ ပို့ကြည့်ပါ");
+}
+
+async function buildStatusMessage(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT account, status, COUNT(*) AS c FROM join_queue GROUP BY account, status"
+  ).all();
+
+  const byAccount = {};
+  for (const r of results) {
+    byAccount[r.account] ??= {};
+    byAccount[r.account][r.status] = r.c;
+  }
+
+  const lines = ["📊 Queue Status"];
+  for (const account of ACCOUNTS) {
+    const c = byAccount[account] || {};
+    lines.push(
+      `\n${account}: queued=${c.queued || 0}  triggered=${c.triggered || 0}  joined=${c.joined || 0}  already_member=${c.already_member || 0}  failed=${c.failed || 0}`
+    );
+  }
+  return lines.join("\n");
+}
+
 // Decides what happens to one URL: brand-new (queue it), a retry of a
 // previously-failed attempt (worth another shot), already successfully
 // joined before (skip — this is the "no wasted API call on a duplicate"
 // guard), or already mid-flight (queued/triggered right now — skip, it's
 // already moving through the pipeline).
-async function enqueueOneUrl(env, chatId, normalized, now) {
+async function enqueueOneUrl(env, chatId, normalized, now, account) {
   const existing = await env.DB.prepare(
-    "SELECT last_status FROM processed_urls WHERE url_normalized = ?"
-  ).bind(normalized).first();
+    "SELECT last_status FROM processed_urls WHERE url_normalized = ? AND account = ?"
+  ).bind(normalized, account).first();
 
   if (!existing) {
     await env.DB.batch([
       env.DB.prepare(
-        "INSERT INTO processed_urls (url_normalized, first_seen_at, last_status) VALUES (?, ?, 'queued')"
-      ).bind(normalized, now),
+        "INSERT INTO processed_urls (url_normalized, account, first_seen_at, last_status) VALUES (?, ?, ?, 'queued')"
+      ).bind(normalized, account, now),
       env.DB.prepare(
-        "INSERT INTO join_queue (chat_id, url_normalized, status, created_at) VALUES (?, ?, 'queued', ?)"
-      ).bind(String(chatId), normalized, now),
+        "INSERT INTO join_queue (chat_id, url_normalized, account, status, created_at) VALUES (?, ?, ?, 'queued', ?)"
+      ).bind(String(chatId), normalized, account, now),
     ]);
     return "queued";
   }
@@ -425,11 +608,11 @@ async function enqueueOneUrl(env, chatId, normalized, now) {
   // last_status === 'failed': re-arm it rather than skipping forever.
   await env.DB.batch([
     env.DB.prepare(
-      "UPDATE processed_urls SET last_status = 'queued' WHERE url_normalized = ?"
-    ).bind(normalized),
+      "UPDATE processed_urls SET last_status = 'queued' WHERE url_normalized = ? AND account = ?"
+    ).bind(normalized, account),
     env.DB.prepare(
-      "INSERT INTO join_queue (chat_id, url_normalized, status, created_at) VALUES (?, ?, 'queued', ?)"
-    ).bind(String(chatId), normalized, now),
+      "INSERT INTO join_queue (chat_id, url_normalized, account, status, created_at) VALUES (?, ?, ?, 'queued', ?)"
+    ).bind(String(chatId), normalized, account, now),
   ]);
   return "retry_queued";
 }
@@ -492,5 +675,54 @@ async function replyToUser(env, chatId, text) {
   });
   if (!res.ok) {
     console.error("sendMessage failed:", res.status, await res.text());
+  }
+}
+
+// Phase 7: sends the CH / JL picker as an inline keyboard. callback_data is
+// "acct:CH" / "acct:JL", read back in handleCallbackQuery.
+async function sendAccountPrompt(env, chatId, validCount, invalidCount) {
+  const invalidNote = invalidCount ? `\n❌ Format မမှန်လို့ ကျော်လိုက်တာ — ${invalidCount} link` : "";
+  const text = `📋 ${validCount} link ရပါတယ်${invalidNote}\n\nဘယ် Account နဲ့ join မလဲ ရွေးပါ 👇`;
+
+  const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      reply_markup: {
+        inline_keyboard: [ACCOUNTS.map((a) => ({ text: `Account ${a}`, callback_data: `acct:${a}` }))],
+      },
+    }),
+  });
+  if (!res.ok) {
+    console.error("sendAccountPrompt failed:", res.status, await res.text());
+  }
+}
+
+// Telegram requires every callback_query to be answered (even with empty
+// text) or the tapped button keeps showing a loading spinner client-side.
+// show_alert pops a modal instead of a toast — used for the expired-session case.
+async function answerCallbackQuery(env, callbackQueryId, text = "", show_alert = false) {
+  const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQueryId, text, show_alert }),
+  });
+  if (!res.ok) {
+    console.error("answerCallbackQuery failed:", res.status, await res.text());
+  }
+}
+
+// Rewrites the original account-picker message in place with the outcome —
+// cleaner than leaving stale buttons on screen plus a separate summary message.
+async function editMessageText(env, chatId, messageId, text) {
+  const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text }),
+  });
+  if (!res.ok) {
+    console.error("editMessageText failed:", res.status, await res.text());
   }
 }

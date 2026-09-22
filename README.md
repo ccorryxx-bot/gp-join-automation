@@ -23,7 +23,8 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 5 - /report endpoint + user notification
 - [x] Phase 6a - bulk-URL intake + one-at-a-time pacing (code complete, **not yet live-tested** — see below)
 - [ ] Phase 6b - end-to-end test **(in progress — webhook leg verified live, see Live Verification Log)**
-- [ ] Phase 7 - production cutover
+- [ ] Phase 7 - multi-account (CH / JL) + admin gating **(code pushed 2026-09-22, not yet live-tested — needs JL_* GitHub secrets added manually, then a real webhook run)**
+- [ ] Phase 8 - production cutover
 
 ## Bulk-URL intake (added 2026-09-22)
 
@@ -52,6 +53,49 @@ A bare single URL (no brackets) still works as before. Behavior:
 - **FloodWait handling** — already existed in `scripts/join_telegram.py` since Phase 4 (`join_with_floodwait_handling`, auto-sleeps floods up to 120s across up to 3 retries, fails fast past that). No change needed here for bulk intake.
 
 **Not yet live-tested** — needs a real multi-URL message sent to the bot once deployed, watching `join_queue` to confirm rows go `queued → triggered → joined/failed` one at a time with the expected gap between them.
+
+## Multi-account (CH / JL) + admin gating (added 2026-09-22, Phase 7)
+
+**Second Telethon account.** A dedicated account "JL" joins the "CH" naming
+convention above (see Secrets). Its credentials live as GitHub Actions
+secrets only — `JL_API_ID`, `JL_API_HASH`, `JL_STRING_SESSION` — the
+Cloudflare Worker never sees them, it only ever passes an `account` string
+("CH" or "JL") through to `join.yml`, which picks the matching secret set.
+
+**Account picker, not auto bulk-join across both accounts.** Sending a URL
+(or `[url,url,...]` list) to the bot no longer queues it immediately. The
+bot replies with an inline-keyboard prompt — "Account CH" / "Account JL" —
+and only enqueues the URLs once the admin taps one. A batch always goes to
+ONE account, chosen once per message; it is never automatically split
+across both. The parked URL list lives in KV (`pending_urls:{chatId}`, 5 min
+TTL) between the prompt and the tap.
+
+**Fully independent per-account queues.** `join_queue` and `processed_urls`
+both gained an `account` column (`processed_urls`' primary key is now
+`(url_normalized, account)` — see `migrations/002_multi_account.sql` for the
+exact statements run against the live DB). This means:
+- The same group can be tracked as joined by CH and separately by JL —
+  dedup is scoped per account, not global.
+- Dispatch pacing (the 1-3 min inter-join cooldown) and PeerFlood pauses are
+  keyed per account (`dispatch:next_allowed_at:CH` / `:JL` in KV) — a pause
+  on one account never blocks the other.
+- `join.yml`'s `concurrency.group` is now `telegram-join-${{ inputs.account }}`
+  instead of a single fixed lane, so CH and JL can have Actions runs
+  in-flight at the same time without queuing behind each other.
+
+**Admin-only gating.** Every message, `/command`, and inline-button tap is
+checked against `ADMIN_TG_ID` (plain var in `wrangler.toml`, not a secret —
+it's just a numeric Telegram user ID) via `isAdmin()` in `src/worker.js`.
+Anyone else's message is silently dropped — no reply at all.
+
+**Commands (admin-only):**
+- `/status` — queue counts (`queued` / `triggered` / `joined` /
+  `already_member` / `failed`) broken out per account
+- `/help` (also `/start`) — short usage reminder
+
+**Not yet live-tested** — needs the three `JL_*` GitHub secrets added
+manually (see Secrets below), then a real message sent to the bot to
+confirm the CH/JL buttons render and route correctly end-to-end.
 
 ## Live Verification Log
 
@@ -90,10 +134,19 @@ Telegram-account-specific secrets are prefixed per account — `CH_` for the fir
 | `CH_TG_API_ID` | join.yml | from my.telegram.org, dedicated "CH" account |
 | `CH_TG_API_HASH` | join.yml | from my.telegram.org, dedicated "CH" account |
 | `CH_TG_SESSION_STRING` | join.yml | generated locally once, dedicated "CH" account — never commit |
+| `JL_API_ID` | join.yml | from my.telegram.org, dedicated "JL" account — **added to secrets manually 2026-09-22, not via CI** |
+| `JL_API_HASH` | join.yml | from my.telegram.org, dedicated "JL" account — **added manually** |
+| `JL_STRING_SESSION` | join.yml | generated locally once, dedicated "JL" account — **added manually**, never commit |
 | `WORKER_REPORT_URL` | join.yml | `https://gp-join-automation.ccorryxx.workers.dev` |
 | `REPORT_SECRET` | join.yml | must match Cloudflare's `REPORT_SECRET` exactly |
 
-> `join.yml` reads these via `secrets.CH_TG_API_ID` / `secrets.CH_TG_API_HASH` / `secrets.CH_TG_SESSION_STRING` and maps them to the plain `TG_API_ID` / `TG_API_HASH` / `TG_SESSION_STRING` env vars that `scripts/join_telegram.py` expects — the account prefix lives only in the secret name, not in the script.
+> `join.yml` picks between the CH_* and JL_* secret sets based on the `account` workflow input (`inputs.account == 'JL' && secrets.JL_API_ID || secrets.CH_TG_API_ID`, same pattern for the other two) and maps the result to the plain `TG_API_ID` / `TG_API_HASH` / `TG_SESSION_STRING` env vars `scripts/join_telegram.py` expects. Note JL's secret names deliberately don't carry the same `_TG_` / `SESSION_STRING` naming as CH's — they were added as `JL_API_ID` / `JL_API_HASH` / `JL_STRING_SESSION`, and the workflow routes to those exact names.
+
+### Cloudflare Worker plain vars (`wrangler.toml` `[vars]`, deployed via CI)
+
+| Var | Used by | Notes |
+|---|---|---|
+| `ADMIN_TG_ID` | webhook-handler, callback handler | `7699538187` — every command/message/button tap is gated on this ID |
 
 ## Deploy
 

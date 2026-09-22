@@ -53,6 +53,11 @@ API_HASH = os.environ["TG_API_HASH"]
 SESSION_STRING = os.environ["TG_SESSION_STRING"]
 GROUP_URL = os.environ["GROUP_URL"]
 QUEUE_ID = os.environ["QUEUE_ID"]
+# Phase 7: which Telethon account this run uses (CH / JL). join.yml already
+# picked the matching TG_API_ID/TG_API_HASH/TG_SESSION_STRING secrets based
+# on this -- it's read here purely for clearer logs when both accounts may
+# have runs in the Actions log around the same time.
+ACCOUNT = os.environ.get("ACCOUNT", "CH")
 REPORT_URL = os.environ.get("REPORT_URL", "").rstrip("/")
 REPORT_SECRET = os.environ.get("REPORT_SECRET", "")
 
@@ -196,7 +201,7 @@ def join_with_floodwait_handling(client, kind, identifier):
 
 def main():
     kind, identifier = extract_identifier(GROUP_URL)
-    print(f"queue_id={QUEUE_ID} kind={kind} identifier={identifier}")
+    print(f"queue_id={QUEUE_ID} account={ACCOUNT} kind={kind} identifier={identifier}")
 
     # join_with_floodwait_handling only anticipates specific Telethon errors.
     # Anything else (revoked session, auth key error, connection drop, a
