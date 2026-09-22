@@ -9,6 +9,32 @@ on:
         required: true
         type: string
 
+# Defense-in-depth alongside the Worker's own in-flight check
+# (dispatchNextQueuedJoin refuses to dispatch while a join_queue row is
+# 'triggered' in D1). That's app-level logic in a Worker; this is a
+# GitHub-enforced guarantee that catches what the Worker check can't --
+# e.g. someone manually re-running this workflow from the Actions tab while
+# an automated run triggered by the dispatcher is already going.
+#
+# Fixed group name (NOT per-queue_id) is deliberate: the whole point is that
+# every run of this workflow shares one lane, so at most one join is ever
+# actually executing no matter how many workflow_dispatch calls land. If a
+# second Telethon account is added later (see README's CH_/ACC2_ prefix
+# convention), split this into a per-account group instead -- e.g.
+# `group: telegram-join-${{ inputs.account_prefix }}` -- so two different
+# accounts can join in parallel without blocking each other unnecessarily.
+concurrency:
+  group: telegram-join-CH
+  # NEVER true here. Cancelling an in-progress run mid-join can leave
+  # Telethon in an inconsistent state -- e.g. ImportChatInviteRequest already
+  # sent to Telegram but the process killed before the /report call fires --
+  # which permanently strands that join_queue row at 'triggered' until the
+  # 15-min stale sweep, and the join may or may not have actually gone
+  # through on Telegram's side with no way to tell from here. `false` queues
+  # the new run instead: it waits for the current one to finish normally,
+  # then runs. Non-destructive, and matches "one at a time" exactly.
+  cancel-in-progress: false
+
 jobs:
   join:
     runs-on: ubuntu-latest
