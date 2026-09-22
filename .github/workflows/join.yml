@@ -24,9 +24,9 @@ jobs:
 
       - name: Join Telegram group
         env:
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          TG_API_ID: ${{ secrets.CH_TG_API_ID }}
+          TG_API_HASH: ${{ secrets.CH_TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.CH_TG_SESSION_STRING }}
           GROUP_URL: ${{ inputs.group_url }}
           QUEUE_ID: ${{ inputs.queue_id }}
           REPORT_URL: ${{ secrets.WORKER_REPORT_URL }}
