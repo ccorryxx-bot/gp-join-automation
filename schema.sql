@@ -10,13 +10,14 @@ CREATE TABLE IF NOT EXISTS processed_urls (
 );
 
 CREATE TABLE IF NOT EXISTS join_queue (
-  id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  chat_id        TEXT NOT NULL,
-  url_normalized TEXT NOT NULL,
-  status         TEXT NOT NULL,
-  detail         TEXT,
-  created_at     INTEGER NOT NULL,
-  updated_at     INTEGER
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id           TEXT NOT NULL,
+  url_normalized    TEXT NOT NULL,
+  status            TEXT NOT NULL,
+  detail            TEXT,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER,
+  dispatch_attempts INTEGER NOT NULL DEFAULT 0  -- added 2026-09-22: bounds GitHub-dispatch retries (see MAX_DISPATCH_ATTEMPTS)
 );
 
 CREATE INDEX IF NOT EXISTS idx_join_queue_status ON join_queue(status, created_at);

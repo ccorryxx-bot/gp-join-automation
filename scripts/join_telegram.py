@@ -121,8 +121,17 @@ def main():
     kind, identifier = extract_identifier(GROUP_URL)
     print(f"queue_id={QUEUE_ID} kind={kind} identifier={identifier}")
 
-    with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
-        status, detail = join_with_floodwait_handling(client, kind, identifier)
+    # join_with_floodwait_handling only anticipates specific Telethon errors.
+    # Anything else (revoked session, auth key error, connection drop, a
+    # Telethon version quirk we haven't seen) must NOT be allowed to crash
+    # this script silently — that leaves the row stuck at 'triggered' forever
+    # with no /report ever sent and the user left wondering what happened.
+    try:
+        with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
+            status, detail = join_with_floodwait_handling(client, kind, identifier)
+    except Exception as e:
+        status, detail = "failed", f"unexpected_error:{type(e).__name__}:{str(e)[:150]}"
+        print(f"[unexpected] {detail}")
 
     report(status, detail)
 
