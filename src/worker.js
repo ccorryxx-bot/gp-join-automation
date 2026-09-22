@@ -85,9 +85,36 @@ async function armDispatchPacingDelay(env, account, delayMs = randomDispatchDela
   });
 }
 
+// Phase 8 (2026-09-23): "leave muted groups" automation. Every 3 days, per
+// account, scan.yml-style scan finds groups where this account has been
+// admin-restricted ("muted", not fully kicked), asks the admin a Y/N
+// confirm in Telegram, then leave.yml actually leaves the confirmed ones.
+// leave:running:{account} is the pause flag dispatchNextQueuedJoinForAccount
+// checks below — same session used from two GitHub runners (two IPs) at
+// once risks a Telegram-side revoke, so joins and leave-runs for ONE
+// account must never overlap. CH and JL are independent sessions, so one
+// account's leave-run never pauses the other's joins.
+const LEAVE_SCAN_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000; // every 3 days, per account
+const LEAVE_SCAN_RUNNING_TTL_SECONDS = 10 * 60; // scan-phase safety cap
+const LEAVE_EXEC_RUNNING_TTL_SECONDS = 20 * 60; // leave-phase safety cap (matches leave.yml timeout-minutes)
+const MAX_LEAVE_DISPATCH_ATTEMPTS = 3; // mirrors MAX_DISPATCH_ATTEMPTS
+
+function leaveRunningKvKey(account) {
+  return `leave:running:${account}`;
+}
+
+function leaveNextScanKvKey(account) {
+  return `leave:next_scan_at:${account}`;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // GET, so it must be checked before the blanket non-POST branch below.
+    if (url.pathname === "/leave-candidates") {
+      return handleLeaveCandidates(request, env);
+    }
 
     if (request.method !== "POST") {
       return new Response("gp-join-automation", { status: 200 });
@@ -95,6 +122,10 @@ export default {
 
     if (url.pathname === "/report") {
       return handleReport(request, env);
+    }
+
+    if (url.pathname === "/leave-report") {
+      return handleLeaveReport(request, env);
     }
 
     return handleTelegramWebhook(request, env, ctx);
@@ -105,6 +136,7 @@ export default {
     // *this* tick is never accidentally caught by the same sweep.
     await sweepStaleTriggered(env);
     await dispatchNextQueuedJoin(env);
+    await maybeTriggerLeaveScan(env);
   },
 };
 
@@ -137,6 +169,13 @@ async function dispatchNextQueuedJoin(env) {
 // gives ~60s natural pacing between joins on that account, more conservative
 // than the 45s target in the roadmap. No internal sleep/loop needed.
 async function dispatchNextQueuedJoinForAccount(env, account) {
+  // Guard 0 (Phase 8): never dispatch a new join for this account while a
+  // leave-scan or leave-execute run is using its session — see the Phase 8
+  // comment above armDispatchPacingDelay for why.
+  if (await env.DEDUP_KV.get(leaveRunningKvKey(account))) {
+    return;
+  }
+
   // Guard 1: never dispatch a new join for this account while one of its
   // rows is already in flight. With bulk intake, several rows can be
   // 'queued' at once — this is what turns "N queued" into "join them one at
@@ -226,6 +265,93 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
     await env.DB.prepare(
       "UPDATE join_queue SET dispatch_attempts = ?, updated_at = ? WHERE id = ?"
     ).bind(attempts, Date.now(), row.id).run();
+  }
+}
+
+// Phase 8: fires from the same 1-min cron tick as dispatchNextQueuedJoin.
+// Cost is negligible (1-2 cheap KV reads per account when nothing is due).
+async function maybeTriggerLeaveScan(env) {
+  for (const account of ACCOUNTS) {
+    await maybeTriggerLeaveScanForAccount(env, account);
+  }
+}
+
+async function maybeTriggerLeaveScanForAccount(env, account) {
+  if (await env.DEDUP_KV.get(leaveRunningKvKey(account))) {
+    return; // already mid-scan or mid-leave for this account
+  }
+  const nextAtRaw = await env.DEDUP_KV.get(leaveNextScanKvKey(account));
+  const nextAt = nextAtRaw ? Number(nextAtRaw) : 0;
+  if (Date.now() < nextAt) {
+    return; // not due yet
+  }
+
+  const now = Date.now();
+  const inserted = await env.DB.prepare(
+    "INSERT INTO leave_scans (account, status, created_at) VALUES (?, 'scanning', ?)"
+  ).bind(account, now).run();
+  const scanId = inserted.meta.last_row_id;
+
+  await env.DEDUP_KV.put(leaveRunningKvKey(account), "1", {
+    expirationTtl: LEAVE_SCAN_RUNNING_TTL_SECONDS,
+  });
+
+  const ok = await dispatchLeaveWorkflow(env, account, "scan", scanId);
+  if (ok) {
+    // Cadence measured from scan *attempts*, not from confirm/leave timing —
+    // "every 3rd day, run this once" regardless of how long the admin takes
+    // to tap Y/N afterwards.
+    await env.DEDUP_KV.put(leaveNextScanKvKey(account), String(now + LEAVE_SCAN_INTERVAL_MS), {
+      expirationTtl: Math.ceil(LEAVE_SCAN_INTERVAL_MS / 1000) + 3600,
+    });
+    return;
+  }
+
+  // Dispatch failed — free the account back up so next minute's tick can
+  // retry, bounded by MAX_LEAVE_DISPATCH_ATTEMPTS so a GitHub-side outage
+  // doesn't hammer the API every minute forever.
+  await env.DEDUP_KV.delete(leaveRunningKvKey(account));
+  const row = await env.DB.prepare("SELECT dispatch_attempts FROM leave_scans WHERE id = ?").bind(scanId).first();
+  const attempts = (row?.dispatch_attempts || 0) + 1;
+  if (attempts >= MAX_LEAVE_DISPATCH_ATTEMPTS) {
+    await env.DB.prepare(
+      "UPDATE leave_scans SET status = 'failed', dispatch_attempts = ?, updated_at = ? WHERE id = ?"
+    ).bind(attempts, Date.now(), scanId).run();
+    await env.DEDUP_KV.put(leaveNextScanKvKey(account), String(now + LEAVE_SCAN_INTERVAL_MS), {
+      expirationTtl: Math.ceil(LEAVE_SCAN_INTERVAL_MS / 1000) + 3600,
+    });
+  } else {
+    await env.DB.prepare(
+      "UPDATE leave_scans SET dispatch_attempts = ?, updated_at = ? WHERE id = ?"
+    ).bind(attempts, Date.now(), scanId).run();
+  }
+}
+
+// Kept separate from dispatchNextQueuedJoinForAccount's inline fetch call
+// rather than unified into one shared helper — that function is already
+// live/tested in production; not touching it for a DRY-only change.
+async function dispatchLeaveWorkflow(env, account, mode, scanId) {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/leave.yml/dispatches`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${env.GH_PAT}`,
+          "Accept": "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "gp-join-automation-dispatcher",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ref: "main", inputs: { account, mode, scan_id: String(scanId) } }),
+      }
+    );
+    if (res.status === 204) return true;
+    console.error(`leave.yml dispatch failed [${account}/${mode}]:`, res.status, await res.text());
+    return false;
+  } catch (err) {
+    console.error(`leave.yml dispatch threw [${account}/${mode}]:`, err);
+    return false;
   }
 }
 
@@ -338,6 +464,161 @@ async function handleReport(request, env) {
   await replyToUser(env, row.chat_id, reportMessage(status, detail));
 
   return new Response("OK", { status: 200 });
+}
+
+function checkReportSecret(request, env) {
+  const incoming = request.headers.get("X-Report-Secret");
+  return !!env.REPORT_SECRET && incoming === env.REPORT_SECRET;
+}
+
+// GET /leave-candidates?scan_id=123 — leave.yml's MODE=leave step calls this
+// to fetch the admin-confirmed peer list rather than taking it as a
+// workflow_dispatch input, so an arbitrarily long muted-group list never
+// has to fit inside GitHub's input size limits.
+async function handleLeaveCandidates(request, env) {
+  if (!checkReportSecret(request, env)) {
+    return new Response("forbidden", { status: 403 });
+  }
+  const url = new URL(request.url);
+  const scanId = Number(url.searchParams.get("scan_id"));
+  if (!Number.isInteger(scanId)) {
+    return new Response("bad request", { status: 400 });
+  }
+  const { results } = await env.DB.prepare(
+    "SELECT peer_id, peer_type, title FROM leave_candidates WHERE scan_id = ? AND status = 'pending'"
+  ).bind(scanId).all();
+  return new Response(JSON.stringify({ candidates: results }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// POST /leave-report — called once by leave.yml's Python step, either after
+// a scan (mode: "scan") or after a leave run (mode: "leave"). One aggregate
+// call per script run, not one per group, matching join_telegram.py's
+// "report once per run" cadence and keeping the "leaving started" /
+// "leaving finished" notices to exactly the two the admin asked for.
+async function handleLeaveReport(request, env) {
+  if (!checkReportSecret(request, env)) {
+    return new Response("forbidden", { status: 403 });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("bad request", { status: 400 });
+  }
+
+  const { mode, account } = body;
+  const scanId = Number(body.scan_id);
+  if (!ACCOUNTS.includes(account) || !Number.isInteger(scanId)) {
+    return new Response("bad request", { status: 400 });
+  }
+
+  // Whichever phase just finished, the session is free again — clear the
+  // pause before doing anything else so a slow D1/Telegram call below never
+  // extends the join-pause past what actually happened on GitHub's side.
+  await env.DEDUP_KV.delete(leaveRunningKvKey(account));
+
+  if (mode === "scan") {
+    const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+    const totalDialogs = Number(body.total_dialogs) || 0;
+    const now = Date.now();
+
+    if (candidates.length > 0) {
+      await env.DB.batch(
+        candidates.map((c) =>
+          env.DB
+            .prepare(
+              "INSERT INTO leave_candidates (scan_id, peer_id, peer_type, title, status, updated_at) VALUES (?, ?, ?, ?, 'pending', ?)"
+            )
+            .bind(scanId, String(c.peer_id), c.peer_type || "channel", c.title || "", now)
+        )
+      );
+    }
+
+    const status = candidates.length > 0 ? "awaiting_confirm" : "done";
+    await env.DB.prepare(
+      "UPDATE leave_scans SET status = ?, total_dialogs = ?, muted_count = ?, updated_at = ? WHERE id = ?"
+    ).bind(status, totalDialogs, candidates.length, now, scanId).run();
+
+    if (candidates.length === 0) {
+      await notifyAdmin(
+        env,
+        `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲမှာ muted (admin-restricted) group မတွေ့ပါဘူး`
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    await notifyAdmin(
+      env,
+      `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက muted (admin-restricted) ${candidates.length} ခု တွေ့ပါတယ်။\n\nLeave လုပ်ဖို့ Confirm ပါ 👇`,
+      {
+        inline_keyboard: [
+          [
+            { text: "✅ Yes, Leave", callback_data: `leaveconfirm:${account}:${scanId}:yes` },
+            { text: "❌ No, Cancel", callback_data: `leaveconfirm:${account}:${scanId}:no` },
+          ],
+        ],
+      }
+    );
+    return new Response("OK", { status: 200 });
+  }
+
+  if (mode === "leave") {
+    const results = Array.isArray(body.results) ? body.results : [];
+    const now = Date.now();
+
+    if (results.length > 0) {
+      await env.DB.batch(
+        results.map((r) =>
+          env.DB
+            .prepare(
+              "UPDATE leave_candidates SET status = ?, detail = ?, updated_at = ? WHERE scan_id = ? AND peer_id = ?"
+            )
+            .bind(r.status === "left" ? "left" : "failed", r.detail || "", now, scanId, String(r.peer_id))
+        )
+      );
+    }
+
+    const leftCount = results.filter((r) => r.status === "left").length;
+    const failedCount = results.length - leftCount;
+    await env.DB.prepare(
+      "UPDATE leave_scans SET status = 'done', left_count = ?, failed_count = ?, updated_at = ? WHERE id = ?"
+    ).bind(leftCount, failedCount, now, scanId).run();
+
+    const remaining = await env.DB.prepare(
+      "SELECT COUNT(*) AS c FROM leave_candidates WHERE scan_id = ? AND status = 'pending'"
+    ).bind(scanId).first();
+    const remainingNote = remaining?.c
+      ? `\n⏭️ ${remaining.c} ခု ကျန်နေပါတယ် (peer-flood ကြောင့် early-stop ဖြစ်လို့) — နောက် ၃ရက် cycle မှာ ပြန်စမှာပါ`
+      : "";
+
+    await notifyAdmin(
+      env,
+      `✅ [${account}] Groups leaving ပြီးသွားပါပြီ — ${leftCount} ခု ထွက်ပြီး, ${failedCount} ခု fail (Auto-join ပြန်စပါပြီ)${remainingNote}`
+    );
+    return new Response("OK", { status: 200 });
+  }
+
+  return new Response("bad request", { status: 400 });
+}
+
+// Phase 8's system notices (scan result, leave-started, leave-finished) go
+// straight to the admin, not tied to any inbound chat_id — reuses
+// TG_BOT_TOKEN like replyToUser but targets ADMIN_TG_ID directly.
+async function notifyAdmin(env, text, replyMarkup) {
+  if (!env.ADMIN_TG_ID) return;
+  const body = { chat_id: env.ADMIN_TG_ID, text };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    console.error("notifyAdmin failed:", res.status, await res.text());
+  }
 }
 
 // Maps scripts/join_telegram.py's `detail` strings (and this file's own
@@ -484,7 +765,17 @@ async function handleCallbackQuery(env, cq) {
     return;
   }
 
-  if (!data.startsWith("acct:") || !chatId) {
+  if (!chatId) {
+    await answerCallbackQuery(env, cq.id);
+    return;
+  }
+
+  if (data.startsWith("leaveconfirm:")) {
+    await handleLeaveConfirmCallback(env, cq, data, chatId, messageId);
+    return;
+  }
+
+  if (!data.startsWith("acct:")) {
     await answerCallbackQuery(env, cq.id);
     return;
   }
@@ -528,6 +819,63 @@ async function handleCallbackQuery(env, cq) {
     await editMessageText(env, chatId, messageId, summary);
   } else {
     await replyToUser(env, chatId, summary);
+  }
+}
+
+// Phase 8: admin tapped Yes/No on the leave-confirm prompt sent from
+// handleLeaveReport. Idempotent against double-taps via the scan's status
+// column — a second tap on an already-actioned prompt is a no-op, not a
+// second dispatch.
+async function handleLeaveConfirmCallback(env, cq, data, chatId, messageId) {
+  const [, account, scanIdRaw, choice] = data.split(":");
+  const scanId = Number(scanIdRaw);
+  if (!ACCOUNTS.includes(account) || !Number.isInteger(scanId)) {
+    await answerCallbackQuery(env, cq.id, "⚠️ Internal error");
+    return;
+  }
+
+  const scan = await env.DB.prepare("SELECT status FROM leave_scans WHERE id = ?").bind(scanId).first();
+  if (!scan || scan.status !== "awaiting_confirm") {
+    await answerCallbackQuery(env, cq.id, "⌛ ဒီ scan ကို action ယူပြီးသားပါ", true);
+    return;
+  }
+
+  if (choice === "no") {
+    await env.DB.prepare("UPDATE leave_scans SET status = 'cancelled', updated_at = ? WHERE id = ?")
+      .bind(Date.now(), scanId).run();
+    await answerCallbackQuery(env, cq.id, "❌ Cancelled");
+    if (messageId) {
+      await editMessageText(env, chatId, messageId, `❌ [${account}] Leave ကို cancel လုပ်လိုက်ပါပြီ`);
+    }
+    return;
+  }
+
+  if (choice === "yes") {
+    await env.DEDUP_KV.put(leaveRunningKvKey(account), "1", {
+      expirationTtl: LEAVE_EXEC_RUNNING_TTL_SECONDS,
+    });
+    await env.DB.prepare("UPDATE leave_scans SET status = 'leaving', updated_at = ? WHERE id = ?")
+      .bind(Date.now(), scanId).run();
+
+    const ok = await dispatchLeaveWorkflow(env, account, "leave", scanId);
+    if (!ok) {
+      // Roll back so the admin can just tap the button again.
+      await env.DEDUP_KV.delete(leaveRunningKvKey(account));
+      await env.DB.prepare("UPDATE leave_scans SET status = 'awaiting_confirm', updated_at = ? WHERE id = ?")
+        .bind(Date.now(), scanId).run();
+      await answerCallbackQuery(env, cq.id, "⚠️ Dispatch မအောင်မြင်ပါ — ပြန်နှိပ်ကြည့်ပါ", true);
+      return;
+    }
+
+    await answerCallbackQuery(env, cq.id, `✅ ${account} leaving စပါပြီ`);
+    if (messageId) {
+      await editMessageText(
+        env,
+        chatId,
+        messageId,
+        `🚪 [${account}] Groups leaving စတင်ပါပြီ — auto-join ကို ခေတ္တ ရပ်ထားပါမယ် (~10-15 min)`
+      );
+    }
   }
 }
 

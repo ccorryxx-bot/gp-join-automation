@@ -46,3 +46,31 @@ CREATE TABLE IF NOT EXISTS debug_log (
   has_report_secret_env INTEGER,
   body_raw              TEXT
 );
+
+-- added 2026-09-23 (Phase 8): "leave muted groups" automation — see
+-- migrations/003_leave_scans.sql for the full write-up.
+CREATE TABLE IF NOT EXISTS leave_scans (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  account           TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'scanning',
+  total_dialogs     INTEGER,
+  muted_count       INTEGER,
+  left_count        INTEGER NOT NULL DEFAULT 0,
+  failed_count      INTEGER NOT NULL DEFAULT 0,
+  dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_leave_scans_account_status ON leave_scans(account, status, created_at);
+
+CREATE TABLE IF NOT EXISTS leave_candidates (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  scan_id    INTEGER NOT NULL REFERENCES leave_scans(id),
+  peer_id    TEXT NOT NULL,
+  peer_type  TEXT NOT NULL,
+  title      TEXT,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  detail     TEXT,
+  updated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_leave_candidates_scan ON leave_candidates(scan_id, status);

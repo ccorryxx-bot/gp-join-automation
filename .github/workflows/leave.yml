@@ -1,0 +1,66 @@
+name: gp-leave
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: "Which Telethon account scans/leaves"
+        required: true
+        type: choice
+        options:
+          - CH
+          - JL
+        default: CH
+      mode:
+        description: "scan (read-only check) or leave (actually leave confirmed groups)"
+        required: true
+        type: choice
+        options:
+          - scan
+          - leave
+        default: scan
+      scan_id:
+        description: "leave_scans.id this run belongs to (set by the Worker)"
+        required: true
+        type: string
+
+# Phase 8 (2026-09-23): deliberately the SAME group as join.yml, not a
+# separate "telegram-leave-*" one. GitHub's concurrency scope is repo-wide,
+# not per-workflow -- reusing join.yml's group name means a leave run and a
+# join run for the SAME account can never execute at the same time, which is
+# exactly the "one session, one IP at a time" guarantee this feature needs
+# (see join.yml's own concurrency comment for the full reasoning). This is
+# on top of, not instead of, the Worker's leave:running:{account} KV flag
+# (dispatchNextQueuedJoinForAccount) -- same defense-in-depth pattern as
+# join.yml: app-level pause here, GitHub-enforced guarantee as the backstop.
+concurrency:
+  group: telegram-join-${{ inputs.account }}
+  cancel-in-progress: false
+
+jobs:
+  leave:
+    runs-on: ubuntu-latest
+    # scan is fast; leave is the ~10-15min phase per the estimate this was
+    # sized against. 20 min gives a safety margin either way.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install telethon
+
+      - name: Scan or leave muted groups
+        env:
+          # Same account -> secret-name ternary as join.yml (see that file's
+          # comment for why CH and JL don't share a naming pattern).
+          TG_API_ID: ${{ inputs.account == 'JL' && secrets.JL_API_ID || secrets.CH_TG_API_ID }}
+          TG_API_HASH: ${{ inputs.account == 'JL' && secrets.JL_API_HASH || secrets.CH_TG_API_HASH }}
+          TG_SESSION_STRING: ${{ inputs.account == 'JL' && secrets.JL_STRING_SESSION || secrets.CH_TG_SESSION_STRING }}
+          ACCOUNT: ${{ inputs.account }}
+          MODE: ${{ inputs.mode }}
+          SCAN_ID: ${{ inputs.scan_id }}
+          REPORT_URL: ${{ secrets.WORKER_REPORT_URL }}
+          REPORT_SECRET: ${{ secrets.REPORT_SECRET }}
+        run: python scripts/leave_groups.py
