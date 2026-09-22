@@ -154,14 +154,35 @@ function denormalizeToJoinUrl(normalized) {
 // Phase 5: called by scripts/join_telegram.py after the Action attempts a join.
 // Body: { queue_id, status: "joined"|"already_member"|"failed", detail? }
 async function handleReport(request, env) {
+  const ts = Date.now();
   const incomingSecret = request.headers.get("X-Report-Secret");
-  if (!env.REPORT_SECRET || incomingSecret !== env.REPORT_SECRET) {
+  const hasSecretHeader = incomingSecret !== null;
+  const secretLen = incomingSecret ? incomingSecret.length : 0;
+  const hasEnvSecret = !!env.REPORT_SECRET;
+  const secretMatches = hasEnvSecret && incomingSecret === env.REPORT_SECRET;
+  const rawBody = await request.text();
+
+  // TEMP DIAGNOSTIC (added while debugging stale_no_report_timeout): log
+  // every request that reaches this handler -- pass or fail -- so a secret
+  // mismatch, a malformed body, or "the request never arrived at all" is
+  // measured from D1 afterward instead of guessed at. Never logs the actual
+  // secret values, only presence/length/match booleans. Remove once the
+  // root cause is confirmed fixed.
+  try {
+    await env.DB.prepare(
+      "INSERT INTO debug_log (ts, method, has_secret_header, secret_len, secret_matches, has_report_secret_env, body_raw) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(ts, request.method, hasSecretHeader ? 1 : 0, secretLen, secretMatches ? 1 : 0, hasEnvSecret ? 1 : 0, rawBody.slice(0, 500)).run();
+  } catch (e) {
+    console.error("debug_log insert failed:", e);
+  }
+
+  if (!secretMatches) {
     return new Response("forbidden", { status: 403 });
   }
 
   let body;
   try {
-    body = await request.json();
+    body = JSON.parse(rawBody);
   } catch {
     return new Response("bad request", { status: 400 });
   }

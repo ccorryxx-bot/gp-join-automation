@@ -21,3 +21,19 @@ CREATE TABLE IF NOT EXISTS join_queue (
 );
 
 CREATE INDEX IF NOT EXISTS idx_join_queue_status ON join_queue(status, created_at);
+
+-- TEMP (added 2026-09-22): captures every request that reaches /report,
+-- pass or fail, while debugging stale_no_report_timeout. Never stores the
+-- actual secret values -- only presence/length/match booleans. Drop this
+-- table once the root cause is confirmed fixed:
+--   DROP TABLE debug_log;
+CREATE TABLE IF NOT EXISTS debug_log (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                    INTEGER NOT NULL,
+  method                TEXT,
+  has_secret_header     INTEGER,
+  secret_len            INTEGER,
+  secret_matches        INTEGER,
+  has_report_secret_env INTEGER,
+  body_raw              TEXT
+);
