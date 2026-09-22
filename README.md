@@ -21,8 +21,34 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 3 - dispatcher Worker (Cron + GitHub dispatch)
 - [x] Phase 4 - join.yml GitHub Action (Telethon join + FloodWait handling)
 - [x] Phase 5 - /report endpoint + user notification
-- [ ] Phase 6 - end-to-end test **(in progress — webhook leg verified live, see Live Verification Log)**
+- [x] Phase 6a - bulk-URL intake + one-at-a-time pacing (code complete, **not yet live-tested** — see below)
+- [ ] Phase 6b - end-to-end test **(in progress — webhook leg verified live, see Live Verification Log)**
 - [ ] Phase 7 - production cutover
+
+## Bulk-URL intake (added 2026-09-22)
+
+The bot now accepts a variable-length list in one message instead of exactly one URL:
+
+```
+[https://t.me/groupA,https://t.me/+inviteHashB,https://t.me/groupC]
+```
+
+A bare single URL (no brackets) still works as before. Behavior:
+
+- **Still strictly one-at-a-time.** Every URL in the list becomes its own `join_queue` row, but `dispatchNextQueuedJoin` now refuses to dispatch a new join while another row is `status = 'triggered'` (in flight) — no matter how many rows are `queued`. This was a real gap before bulk intake existed: the old cron just popped 1 `queued` row/tick with no check for an in-flight one, which only happened to be safe because there was never more than one row queued at a time.
+- **1–3 min random delay between joins.** After a join resolves (via `/report`, or via the stale-timeout sweep), the Worker writes a random `next_allowed_at` timestamp (KV, key `dispatch:next_allowed_at`, 1–3 min out) that `dispatchNextQueuedJoin` must clear before picking up the next `queued` row.
+- **No queue → workflow just idles.** The cron tick no-ops when `join_queue` has no `queued` rows; when a new URL arrives it's inserted as `queued` and picked up on a later tick — no separate "resume" step needed.
+- **Duplicate / already-joined handling** (`enqueueOneUrl` in `src/worker.js`), checked against `processed_urls.last_status`:
+  - not seen before → insert + queue normally
+  - `joined` / `already_member` → **skipped**, no new Action run triggered (this is the "don't waste an API call on a duplicate" guard)
+  - `queued` / `triggered` → **skipped**, already moving through the pipeline
+  - `failed` → **re-queued** (worth another attempt)
+  - a URL repeated within the *same* incoming message is also deduped before touching the DB a second time
+- **Storage:** still plain D1 — no new table. Each URL is one `join_queue` row exactly as before; bulk just means a message can now insert several rows instead of one. `processed_urls` remains the one-row-per-URL dedup/history table.
+- **One summary reply per message** (not one reply per URL) — e.g. "✅ Queued — 7 link / ⏭️ Skip (already joined) — 2 link" — so a 10-link batch doesn't flood the chat.
+- **FloodWait handling** — already existed in `scripts/join_telegram.py` since Phase 4 (`join_with_floodwait_handling`, auto-sleeps floods up to 120s across up to 3 retries, fails fast past that). No change needed here for bulk intake.
+
+**Not yet live-tested** — needs a real multi-URL message sent to the bot once deployed, watching `join_queue` to confirm rows go `queued → triggered → joined/failed` one at a time with the expected gap between them.
 
 ## Live Verification Log
 

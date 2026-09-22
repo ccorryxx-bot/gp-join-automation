@@ -7,6 +7,37 @@
 const KV_DEDUP_TTL_SECONDS = 600; // 10 min — covers Telegram's webhook retry window
 const REPORT_STATUSES = new Set(["joined", "already_member", "failed"]);
 
+// Phase 6: bulk-URL intake. A message can now carry a variable-length list
+// like "[https://t.me/a,https://t.me/b,https://t.me/c]" instead of exactly
+// one URL. Each URL still becomes its own join_queue row and is still joined
+// ONE AT A TIME — see dispatchNextQueuedJoin's in-flight check below. This is
+// deliberate: Telegram accounts get FloodWait'd or banned fast if joins fire
+// back-to-back, so "accept N URLs at once" must never mean "join N at once".
+const MAX_URLS_PER_MESSAGE = 50; // sanity cap, not a target batch size
+
+// Random pacing delay applied AFTER each join attempt reports back (success
+// or failure) and BEFORE the next queued URL is dispatched. Stored in KV
+// (not D1) because it's ephemeral scheduling state, not queue data.
+const MIN_DISPATCH_DELAY_MS = 60 * 1000; // 1 min
+const MAX_DISPATCH_DELAY_MS = 3 * 60 * 1000; // 3 min
+const DISPATCH_PACING_KV_KEY = "dispatch:next_allowed_at";
+
+function randomDispatchDelayMs() {
+  return (
+    MIN_DISPATCH_DELAY_MS +
+    Math.floor(Math.random() * (MAX_DISPATCH_DELAY_MS - MIN_DISPATCH_DELAY_MS))
+  );
+}
+
+async function armDispatchPacingDelay(env) {
+  const delayMs = randomDispatchDelayMs();
+  // TTL padded well past the max delay so the key never outlives its purpose
+  // but also never expires mid-wait on a slow tick.
+  await env.DEDUP_KV.put(DISPATCH_PACING_KV_KEY, String(Date.now() + delayMs), {
+    expirationTtl: 600,
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -50,10 +81,27 @@ const STALE_TRIGGERED_TIMEOUT_MS = 15 * 60 * 1000; // 15 min
 // between joins, which is more conservative than the 45s target in the roadmap.
 // No internal sleep/loop needed.
 async function dispatchNextQueuedJoin(env) {
+  // Guard 1: never dispatch a new join while one is already in flight. With
+  // bulk intake, several rows can be 'queued' at once — this is what turns
+  // "N queued" into "join them one at a time" instead of a burst.
+  const inFlight = await env.DB.prepare(
+    "SELECT id FROM join_queue WHERE status = 'triggered' LIMIT 1"
+  ).first();
+  if (inFlight) return; // previous join still running / awaiting /report
+
+  // Guard 2: pacing delay between one join finishing and the next starting.
+  // Set by armDispatchPacingDelay() from handleReport/sweepStaleTriggered.
+  const nextAllowedRaw = await env.DEDUP_KV.get(DISPATCH_PACING_KV_KEY);
+  const nextAllowedAt = nextAllowedRaw ? Number(nextAllowedRaw) : 0;
+  if (Date.now() < nextAllowedAt) return; // still inside the 1-3 min cooldown
+
   const row = await env.DB.prepare(
     "SELECT id, chat_id, url_normalized, dispatch_attempts FROM join_queue WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1"
   ).first();
 
+  // Nothing queued: this is the "no more URLs → workflow stops" case. No
+  // special state to reset — the moment a new URL arrives via the webhook
+  // it's inserted as 'queued' and the very next cron tick picks it up again.
   if (!row) return; // nothing queued — no-op tick
 
   const joinUrl = denormalizeToJoinUrl(row.url_normalized);
@@ -136,6 +184,7 @@ async function sweepStaleTriggered(env) {
     await env.DB.prepare(
       "UPDATE join_queue SET status = 'failed', detail = 'stale_no_report_timeout', updated_at = ? WHERE id = ?"
     ).bind(Date.now(), row.id).run();
+    await armDispatchPacingDelay(env);
     await replyToUser(env, row.chat_id, reportMessage("failed", "stale_no_report_timeout"));
   }
 }
@@ -219,6 +268,11 @@ async function handleReport(request, env) {
       .bind(status, row.url_normalized),
   ]);
 
+  // This join is now resolved (joined / already_member / failed) — start the
+  // 1-3 min cooldown before dispatchNextQueuedJoin is allowed to pick up the
+  // next queued URL, if any.
+  await armDispatchPacingDelay(env);
+
   await replyToUser(env, row.chat_id, reportMessage(status, detail));
 
   return new Response("OK", { status: 200 });
@@ -284,38 +338,116 @@ async function handleTelegramWebhook(request, env, ctx) {
     }
     await env.DEDUP_KV.put(dedupKey, "1", { expirationTtl: KV_DEDUP_TTL_SECONDS });
 
-    const normalized = normalizeTelegramInviteUrl(text);
-    if (!normalized) {
-      await replyToUser(env, chatId, "⚠️ Valid Telegram group link ပို့ပါ (t.me/... or t.me/+...)");
-      return new Response("OK", { status: 200 });
-    }
-
+    // Phase 6: message can be "[https://t.me/a,https://t.me/b,...]" (any
+    // count) or still a single bare link — both flow through the same path.
+    // Every URL still lands as its own join_queue row; dispatchNextQueuedJoin
+    // is what enforces "one at a time, 1-3 min apart", not this handler.
+    const rawEntries = extractUrlEntries(text);
+    const seenInMessage = new Set();
     const now = Date.now();
-    const insertResult = await env.DB
-      .prepare(
-        "INSERT OR IGNORE INTO processed_urls (url_normalized, first_seen_at, last_status) VALUES (?, ?, 'queued')"
-      )
-      .bind(normalized, now)
-      .run();
+    const tally = { queued: 0, retry_queued: 0, already_done: 0, in_progress: 0, invalid: 0 };
 
-    if (insertResult.meta.changes === 0) {
-      await replyToUser(env, chatId, "⚠️ ဒီ link ကို queue ထဲ ရှိပြီးသားပါ");
-      return new Response("OK", { status: 200 });
+    for (const rawEntry of rawEntries) {
+      const normalized = normalizeTelegramInviteUrl(rawEntry);
+      if (!normalized) {
+        tally.invalid++;
+        continue;
+      }
+      // A pasted list can repeat a link by accident — dedupe within this one
+      // message too, without a second DB round trip for the repeat.
+      if (seenInMessage.has(normalized)) {
+        tally.in_progress++;
+        continue;
+      }
+      seenInMessage.add(normalized);
+
+      const outcome = await enqueueOneUrl(env, chatId, normalized, now);
+      tally[outcome]++;
     }
 
-    await env.DB
-      .prepare(
-        "INSERT INTO join_queue (chat_id, url_normalized, status, created_at) VALUES (?, ?, 'queued', ?)"
-      )
-      .bind(String(chatId), normalized, now)
-      .run();
-
-    await replyToUser(env, chatId, "✅ Queued — join automation ဆက်လက်လုပ်ဆောင်ပါမည်");
+    await replyToUser(env, chatId, buildIntakeSummary(tally, rawEntries.length));
     return new Response("OK", { status: 200 });
   } catch (err) {
     console.error("webhook-handler error:", err);
     return new Response("OK", { status: 200 });
   }
+}
+
+// Decides what happens to one URL: brand-new (queue it), a retry of a
+// previously-failed attempt (worth another shot), already successfully
+// joined before (skip — this is the "no wasted API call on a duplicate"
+// guard), or already mid-flight (queued/triggered right now — skip, it's
+// already moving through the pipeline).
+async function enqueueOneUrl(env, chatId, normalized, now) {
+  const existing = await env.DB.prepare(
+    "SELECT last_status FROM processed_urls WHERE url_normalized = ?"
+  ).bind(normalized).first();
+
+  if (!existing) {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO processed_urls (url_normalized, first_seen_at, last_status) VALUES (?, ?, 'queued')"
+      ).bind(normalized, now),
+      env.DB.prepare(
+        "INSERT INTO join_queue (chat_id, url_normalized, status, created_at) VALUES (?, ?, 'queued', ?)"
+      ).bind(String(chatId), normalized, now),
+    ]);
+    return "queued";
+  }
+
+  if (existing.last_status === "joined" || existing.last_status === "already_member") {
+    return "already_done";
+  }
+
+  if (existing.last_status === "queued" || existing.last_status === "triggered") {
+    return "in_progress";
+  }
+
+  // last_status === 'failed': re-arm it rather than skipping forever.
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE processed_urls SET last_status = 'queued' WHERE url_normalized = ?"
+    ).bind(normalized),
+    env.DB.prepare(
+      "INSERT INTO join_queue (chat_id, url_normalized, status, created_at) VALUES (?, ?, 'queued', ?)"
+    ).bind(String(chatId), normalized, now),
+  ]);
+  return "retry_queued";
+}
+
+// One summary reply per incoming message instead of one reply per URL --
+// a 10-link batch shouldn't produce 10 separate Telegram messages.
+function buildIntakeSummary(tally, totalEntries) {
+  const handled = tally.queued + tally.retry_queued + tally.already_done + tally.in_progress;
+  if (totalEntries === 0 || (handled === 0 && tally.invalid === totalEntries)) {
+    return "⚠️ Valid Telegram group link ပို့ပါ (t.me/... or t.me/+...)\nList ပို့ချင်ရင် [https://t.me/a,https://t.me/b] format သုံးပါ";
+  }
+
+  const lines = [];
+  if (tally.queued) lines.push(`✅ Queue ထဲ ထည့်ပြီးပါပြီ — ${tally.queued} link`);
+  if (tally.retry_queued) lines.push(`🔁 ပြန်ကြိုးစားမည် (အရင်တစ်ခါ fail ဖြစ်ခဲ့တာ) — ${tally.retry_queued} link`);
+  if (tally.already_done) lines.push(`⏭️ Skip (join ဝင်ပြီးသား) — ${tally.already_done} link`);
+  if (tally.in_progress) lines.push(`⏳ Skip (queue ထဲမှာ လုပ်ဆောင်နေဆဲ) — ${tally.in_progress} link`);
+  if (tally.invalid) lines.push(`❌ Link format မမှန်လို့ ကျော်လိုက်ပါတယ် — ${tally.invalid} link`);
+  if (tally.queued + tally.retry_queued > 0) {
+    lines.push("\nတစ်ခုစီကို ၁-၃ မိနစ် ခြားပြီး တစ်ခုချင်းစီ join ဝင်သွားပါမယ်");
+  }
+  return lines.join("\n");
+}
+
+// Splits "[https://t.me/a,https://t.me/b,https://t.me/c]" into raw entries.
+// Also accepts a bare single URL with no brackets (old behavior). Brackets
+// are optional on purpose -- a comma-separated list without them still works.
+function extractUrlEntries(text) {
+  const trimmed = text.trim();
+  const inner =
+    trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
+
+  return inner
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, MAX_URLS_PER_MESSAGE);
 }
 
 function normalizeTelegramInviteUrl(text) {
