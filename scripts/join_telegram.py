@@ -39,6 +39,7 @@ from telethon.errors import (
     FloodWaitError,
     InviteHashExpiredError,
     InviteHashInvalidError,
+    PeerFloodError,
     RPCError,
     UserAlreadyParticipantError,
     UserBannedInChannelError,
@@ -173,6 +174,22 @@ def join_with_floodwait_handling(client, kind, identifier):
             return "failed", "channel_private_or_kicked"
         except UserBannedInChannelError:
             return "failed", "user_banned_in_channel"
+        except PeerFloodError:
+            # Telegram's anti-spam system, not a per-URL problem. Unlike
+            # FloodWaitError, Telegram gives no "wait N seconds" here -- it's
+            # a judgment call by their abuse system that this account is
+            # doing too many peer actions (joins/adds) too fast. Must be
+            # caught BEFORE the generic RPCError handler below, since
+            # PeerFloodError is itself a subclass of RPCError in Telethon --
+            # if RPCError came first it would silently swallow this as a
+            # generic rpc_error_PeerFloodError and the caller would just move
+            # on to the next URL, which is exactly the wrong response: that
+            # keeps hammering peer actions on a flagged account and risks
+            # escalating to a harder/longer restriction. Instead this bubbles
+            # up as its own detail code so the Worker can pause the ENTIRE
+            # queue (not just skip this one URL) -- see PEER_FLOOD_PAUSE_MS
+            # in src/worker.js.
+            return "failed", "peer_flood_detected"
         except RPCError as e:
             return "failed", f"rpc_error_{type(e).__name__}"
 

@@ -22,6 +22,19 @@ const MIN_DISPATCH_DELAY_MS = 60 * 1000; // 1 min
 const MAX_DISPATCH_DELAY_MS = 3 * 60 * 1000; // 3 min
 const DISPATCH_PACING_KV_KEY = "dispatch:next_allowed_at";
 
+// PeerFloodError is Telegram's account-level anti-spam signal, not a
+// per-URL problem (see scripts/join_telegram.py). Telegram does not publish
+// an exact cooldown for it; 24h is a commonly-cited, conservative estimate
+// from the wider Telethon/MTProto community, not a number Telegram itself
+// guarantees -- treat it as a tunable default, not a proven fact.
+// Overridable without a redeploy via a `PEER_FLOOD_PAUSE_HOURS` var/secret.
+const DEFAULT_PEER_FLOOD_PAUSE_HOURS = 24;
+
+function peerFloodPauseMs(env) {
+  const hours = Number(env.PEER_FLOOD_PAUSE_HOURS) || DEFAULT_PEER_FLOOD_PAUSE_HOURS;
+  return hours * 60 * 60 * 1000;
+}
+
 function randomDispatchDelayMs() {
   return (
     MIN_DISPATCH_DELAY_MS +
@@ -29,12 +42,14 @@ function randomDispatchDelayMs() {
   );
 }
 
-async function armDispatchPacingDelay(env) {
-  const delayMs = randomDispatchDelayMs();
-  // TTL padded well past the max delay so the key never outlives its purpose
-  // but also never expires mid-wait on a slow tick.
+// delayMs defaults to the normal 1-3 min inter-join pacing, but callers pass
+// a much larger value for a PeerFlood pause. TTL is derived from delayMs
+// (with a buffer) rather than a fixed 600s -- a fixed short TTL would let a
+// 24h pause silently expire from KV after 10 minutes and defeat the pause.
+async function armDispatchPacingDelay(env, delayMs = randomDispatchDelayMs()) {
+  const ttlSeconds = Math.max(60, Math.ceil(delayMs / 1000) + 300);
   await env.DEDUP_KV.put(DISPATCH_PACING_KV_KEY, String(Date.now() + delayMs), {
-    expirationTtl: 600,
+    expirationTtl: ttlSeconds,
   });
 }
 
@@ -269,9 +284,12 @@ async function handleReport(request, env) {
   ]);
 
   // This join is now resolved (joined / already_member / failed) — start the
-  // 1-3 min cooldown before dispatchNextQueuedJoin is allowed to pick up the
-  // next queued URL, if any.
-  await armDispatchPacingDelay(env);
+  // cooldown before dispatchNextQueuedJoin is allowed to pick up the next
+  // queued URL, if any. Normally 1-3 min; PeerFlood is a signal about the
+  // ACCOUNT, not this one URL, so it pauses the whole queue much longer
+  // instead of the usual short inter-join gap.
+  const isPeerFlood = detail === "peer_flood_detected";
+  await armDispatchPacingDelay(env, isPeerFlood ? peerFloodPauseMs(env) : undefined);
 
   await replyToUser(env, row.chat_id, reportMessage(status, detail));
 
@@ -288,6 +306,7 @@ const FRIENDLY_DETAIL_PREFIXES = [
   ["account_joined_too_many_channels", "Account က group အများဆုံး ဝင်ပြီးသား ဖြစ်နေပါတယ်"],
   ["channel_private_or_kicked", "Group က private ဖြစ်နေတယ် (သို့) ဒီ account ကို ထုတ်ထားပါတယ်"],
   ["user_banned_in_channel", "ဒီ account ကို group ထဲက banned ဖြစ်ထားပါတယ်"],
+  ["peer_flood_detected", "Telegram ရဲ့ Anti-spam system က ဒီ account ကို ယာယီ flag လုပ်လိုက်ပါတယ် — Automation တစ်ခုလုံးကို ခဏရပ်ထားပါမယ် (queue ထဲက link တွေ မပျက်ပါဘူး၊ ပြန်စမှာပါ)"],
   ["rpc_error_", "Telegram API ကနေ error ပြန်ပေးလိုက်ပါတယ်"],
   ["denormalize_failed", "Link format ကို ပြန်ပြင်လို့ မရဘူး (internal bug — dev ကို report ပါ)"],
   ["github_dispatch_failed", "GitHub Action ကို trigger လုပ်လို့ မရဘူး (GH_PAT / network ပြဿနာ ဖြစ်နိုင်ပါတယ်)"],
