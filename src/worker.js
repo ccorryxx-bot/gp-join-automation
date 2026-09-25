@@ -705,11 +705,16 @@ async function handleTelegramWebhook(request, env, ctx) {
     const seenInMessage = new Set();
     const normalizedList = [];
     let invalidCount = 0;
+    let unsupportedCount = 0; // t.me/c/... deep links -- recognized, but can't auto-join
 
     for (const rawEntry of rawEntries) {
       const normalized = normalizeTelegramInviteUrl(rawEntry);
       if (!normalized) {
         invalidCount++;
+        continue;
+      }
+      if (normalized.startsWith("channelref:")) {
+        unsupportedCount++;
         continue;
       }
       // A pasted list can repeat a link by accident — dedupe within this one
@@ -720,20 +725,16 @@ async function handleTelegramWebhook(request, env, ctx) {
     }
 
     if (normalizedList.length === 0) {
-      await replyToUser(
-        env,
-        chatId,
-        "⚠️ Valid Telegram group link ပို့ပါ (t.me/... or t.me/+...)\nList ပို့ချင်ရင် [https://t.me/a,https://t.me/b] format သုံးပါ"
-      );
+      await replyToUser(env, chatId, buildNoValidLinksMessage(unsupportedCount));
       return new Response("OK", { status: 200 });
     }
 
     await env.DEDUP_KV.put(
       pendingSelectionKvKey(chatId),
-      JSON.stringify({ urls: normalizedList, invalidCount }),
+      JSON.stringify({ urls: normalizedList, invalidCount, unsupportedCount }),
       { expirationTtl: PENDING_SELECTION_TTL_SECONDS }
     );
-    await sendAccountPrompt(env, chatId, normalizedList.length, invalidCount);
+    await sendAccountPrompt(env, chatId, normalizedList.length, invalidCount, unsupportedCount);
     return new Response("OK", { status: 200 });
   } catch (err) {
     console.error("webhook-handler error:", err);
@@ -816,9 +817,16 @@ async function handleCallbackQuery(env, cq) {
     return;
   }
 
-  const { urls, invalidCount } = pending;
+  const { urls, invalidCount, unsupportedCount } = pending;
   const now = Date.now();
-  const tally = { queued: 0, retry_queued: 0, already_done: 0, in_progress: 0, invalid: invalidCount || 0 };
+  const tally = {
+    queued: 0,
+    retry_queued: 0,
+    already_done: 0,
+    in_progress: 0,
+    invalid: invalidCount || 0,
+    unsupported: unsupportedCount || 0,
+  };
 
   for (const normalized of urls) {
     const outcome = await enqueueOneUrl(env, chatId, normalized, now, account);
@@ -827,7 +835,7 @@ async function handleCallbackQuery(env, cq) {
 
   await answerCallbackQuery(env, cq.id, `✅ ${account} ရွေးပြီးပါပြီ`);
 
-  const summary = `Account: ${account}\n\n${buildIntakeSummary(tally, urls.length + (invalidCount || 0))}`;
+  const summary = `Account: ${account}\n\n${buildIntakeSummary(tally, urls.length + (invalidCount || 0) + (unsupportedCount || 0))}`;
   if (messageId) {
     await editMessageText(env, chatId, messageId, summary);
   } else {
@@ -895,7 +903,10 @@ async function handleLeaveConfirmCallback(env, cq, data, chatId, messageId) {
 const HELP_TEXT = [
   "🤖 gp-join-automation",
   "",
-  "Group link (တစ်ခု (သို့) [url,url,...] list) ပို့ပါ — ဘယ် account (CH / JL) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
+  "Group link ပို့ပါ — line တစ်ကြောင်းကို link တစ်ခုစီ (numbered list ဖြစ်နိုင်တယ်):",
+  "1. https://t.me/+xxxxxxxxxxxx",
+  "2. https://t.me/+yyyyyyyyyyyy",
+  "URL ဘေးနားမှာ extra စာသား မကပ်ပါစေနဲ့ — ဘယ် account (CH / JL) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
   "",
   "/status — Queue status (account တစ်ခုချင်းစီ)",
   "/leavescan — Muted group scan စတင်ရန် (account ရွေးပါမယ်, cron မဟုတ်ဘူး — Admin ကိုယ်တိုင် ခေါ်မှ run တယ်)",
@@ -983,12 +994,32 @@ async function enqueueOneUrl(env, chatId, normalized, now, account) {
   return "retry_queued";
 }
 
+// (2026-09-26) Describes the new required format: one link per line,
+// nothing else on the line. Replaces the old "[a,b,c]" bracket-format hint.
+function buildNoValidLinksMessage(unsupportedCount) {
+  const lines = [
+    "⚠️ Valid Telegram invite link ပို့ပါ — line တစ်ကြောင်းကို link တစ်ခုစီ ဖြစ်ရပါမယ်:",
+    "",
+    "1. https://t.me/+xxxxxxxxxxxx",
+    "2. https://t.me/+yyyyyyyyyyyy",
+    "",
+    "URL ဘေးနားမှာ extra စာသား မကပ်ပါစေနဲ့။",
+  ];
+  if (unsupportedCount) {
+    lines.push(
+      "",
+      `🚫 t.me/c/... format ${unsupportedCount} ခု ပါလာပါတယ် — ဒါက invite link မဟုတ်လို့ auto-join မရပါဘူး (Account ကိုယ်တိုင် member ဖြစ်ပြီးသားမှသာ ဖွင့်ကြည့်လို့ ရပါမယ်)`
+    );
+  }
+  return lines.join("\n");
+}
+
 // One summary reply per incoming message instead of one reply per URL --
 // a 10-link batch shouldn't produce 10 separate Telegram messages.
 function buildIntakeSummary(tally, totalEntries) {
   const handled = tally.queued + tally.retry_queued + tally.already_done + tally.in_progress;
-  if (totalEntries === 0 || (handled === 0 && tally.invalid === totalEntries)) {
-    return "⚠️ Valid Telegram group link ပို့ပါ (t.me/... or t.me/+...)\nList ပို့ချင်ရင် [https://t.me/a,https://t.me/b] format သုံးပါ";
+  if (totalEntries === 0 || (handled === 0 && tally.invalid + tally.unsupported === totalEntries)) {
+    return buildNoValidLinksMessage(tally.unsupported);
   }
 
   const lines = [];
@@ -997,40 +1028,83 @@ function buildIntakeSummary(tally, totalEntries) {
   if (tally.already_done) lines.push(`⏭️ Skip (join ဝင်ပြီးသား) — ${tally.already_done} link`);
   if (tally.in_progress) lines.push(`⏳ Skip (queue ထဲမှာ လုပ်ဆောင်နေဆဲ) — ${tally.in_progress} link`);
   if (tally.invalid) lines.push(`❌ Link format မမှန်လို့ ကျော်လိုက်ပါတယ် — ${tally.invalid} link`);
+  if (tally.unsupported) lines.push(`🚫 t.me/c/... link — auto-join မရပါ — ${tally.unsupported} link`);
   if (tally.queued + tally.retry_queued > 0) {
     lines.push("\nတစ်ခုစီကို ၁-၃ မိနစ် ခြားပြီး တစ်ခုချင်းစီ join ဝင်သွားပါမယ်");
   }
   return lines.join("\n");
 }
 
-// Splits "[https://t.me/a,https://t.me/b,https://t.me/c]" into raw entries.
-// Also accepts a bare single URL with no brackets (old behavior). Brackets
-// are optional on purpose -- a comma-separated list without them still works.
+// Accepts a numbered/bulleted list, one link per line -- e.g.
+//   1. https://t.me/+RdIqky7oiOs0MzI1
+//   2. https://t.me/+_M2ixP_4Pp1iOWRl
+//   3. https://t.me/c/2617024293/60
+// (2026-09-26 format change) The old behavior only split on commas, so a
+// pasted multi-line list with no commas collapsed into a single raw entry
+// and normalizeTelegramInviteUrl's loose regex.match() would silently grab
+// just the first URL out of it -- the rest vanished with no error. Now
+// every line is its own entry. A leading "1.", "1)", "-", or "•" marker
+// (with the following space) is stripped; normalizeTelegramInviteUrl below
+// then requires the *rest* of the entry to be nothing but the link, start
+// to end -- so "text glued next to a url" is rejected as invalid instead of
+// silently pattern-matched out of the noise. The legacy single-line
+// "[a,b,c]" / "a,b,c" form still works too (comma-split within a line).
 function extractUrlEntries(text) {
-  const trimmed = text.trim();
-  const inner =
-    trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
+  const rawEntries = [];
 
-  return inner
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .slice(0, MAX_URLS_PER_MESSAGE);
-}
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
 
-function normalizeTelegramInviteUrl(text) {
-  const match = text.match(
-    /(?:https?:\/\/)?(?:www\.)?t\.me\/(\+|joinchat\/)?([A-Za-z0-9_-]+)/i
-  );
-  if (!match) return null;
+    const bracketless =
+      line.startsWith("[") && line.endsWith("]") ? line.slice(1, -1) : line;
 
-  const [, invitePrefix, identifier] = match;
-
-  if (invitePrefix) {
-    return `invite:${identifier}`;
+    for (const part of bracketless.split(",")) {
+      const entry = part.trim().replace(/^(?:\d+[.)]|[-•*])\s+/, "");
+      if (entry) rawEntries.push(entry);
+    }
   }
 
-  return `username:${identifier.toLowerCase()}`;
+  return rawEntries.slice(0, MAX_URLS_PER_MESSAGE);
+}
+
+// Normalizes ONE already-isolated entry (extractUrlEntries has already
+// stripped any "1. " / "-" marker off it). Anchored start-to-end on purpose
+// -- the whole entry must be nothing but the link, or this returns null.
+// The old version used a bare regex.match() with no anchors, which happily
+// pulled a URL out of a sentence; that's the exact "text glued to the url"
+// ambiguity the 2026-09-26 format change is meant to reject outright,
+// rather than silently tolerate.
+function normalizeTelegramInviteUrl(text) {
+  const inviteMatch = text.match(
+    /^(?:https?:\/\/)?(?:www\.)?t\.me\/(\+|joinchat\/)([A-Za-z0-9_-]+)\/?$/i
+  );
+  if (inviteMatch) {
+    return `invite:${inviteMatch[2]}`;
+  }
+
+  // t.me/c/<internal_channel_id>/<message_id> -- a deep link to a message
+  // inside a channel, NOT an invite link. It carries no invite hash, so
+  // Telethon's ImportChatInviteRequest/JoinChannelRequest has nothing to
+  // join with -- Telegram only allows joining blind via a public @username
+  // or an invite hash, and this is neither. Recognized here as its own
+  // category so it's reported to the admin as "can't auto-join" instead of
+  // silently landing in the generic "invalid format" bucket.
+  const channelRefMatch = text.match(
+    /^(?:https?:\/\/)?(?:www\.)?t\.me\/c\/(\d+)(?:\/\d+)?\/?$/i
+  );
+  if (channelRefMatch) {
+    return `channelref:${channelRefMatch[1]}`;
+  }
+
+  const usernameMatch = text.match(
+    /^(?:https?:\/\/)?(?:www\.)?t\.me\/([A-Za-z0-9_-]+)\/?$/i
+  );
+  if (usernameMatch) {
+    return `username:${usernameMatch[1].toLowerCase()}`;
+  }
+
+  return null;
 }
 
 async function replyToUser(env, chatId, text) {
@@ -1046,9 +1120,12 @@ async function replyToUser(env, chatId, text) {
 
 // Phase 7: sends the CH / JL picker as an inline keyboard. callback_data is
 // "acct:CH" / "acct:JL", read back in handleCallbackQuery.
-async function sendAccountPrompt(env, chatId, validCount, invalidCount) {
+async function sendAccountPrompt(env, chatId, validCount, invalidCount, unsupportedCount) {
   const invalidNote = invalidCount ? `\n❌ Format မမှန်လို့ ကျော်လိုက်တာ — ${invalidCount} link` : "";
-  const text = `📋 ${validCount} link ရပါတယ်${invalidNote}\n\nဘယ် Account နဲ့ join မလဲ ရွေးပါ 👇`;
+  const unsupportedNote = unsupportedCount
+    ? `\n🚫 t.me/c/... link (auto-join မရ) — ${unsupportedCount} link`
+    : "";
+  const text = `📋 ${validCount} link ရပါတယ်${invalidNote}${unsupportedNote}\n\nဘယ် Account နဲ့ join မလဲ ရွေးပါ 👇`;
 
   const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
     method: "POST",
