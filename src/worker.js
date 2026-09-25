@@ -550,9 +550,22 @@ async function handleLeaveReport(request, env) {
       return new Response("OK", { status: 200 });
     }
 
+    // Show the actual group titles (not just a count) so the admin can eyeball
+    // the candidate list before confirming — capped to keep the Telegram
+    // message short even when a scan flags a large batch at once.
+    const MAX_LISTED_CANDIDATES = 15;
+    const MAX_TITLE_LENGTH = 60;
+    const titleLines = candidates
+      .slice(0, MAX_LISTED_CANDIDATES)
+      .map((c, i) => `${i + 1}. ${(c.title || "(no title)").slice(0, MAX_TITLE_LENGTH)}`)
+      .join("\n");
+    const moreNote = candidates.length > MAX_LISTED_CANDIDATES
+      ? `\n...နောက်ထပ် ${candidates.length - MAX_LISTED_CANDIDATES} ခု`
+      : "";
+
     await notifyAdmin(
       env,
-      `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက muted (admin-restricted) ${candidates.length} ခု တွေ့ပါတယ်။\n\nLeave လုပ်ဖို့ Confirm ပါ 👇`,
+      `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက muted (admin-restricted) ${candidates.length} ခု တွေ့ပါတယ်။\n\n${titleLines}${moreNote}\n\nLeave လုပ်ဖို့ Confirm ပါ 👇`,
       {
         inline_keyboard: [
           [
