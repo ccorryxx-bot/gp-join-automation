@@ -2,14 +2,17 @@
 Phase 8 (2026-09-23): "leave muted groups" automation, invoked by
 .github/workflows/leave.yml. Two modes, selected by MODE:
 
-  MODE=scan  - read-only. Iterates every dialog for this account, finds
-               groups/supergroups where Telegram shows this account as
-               admin-restricted (banned_rights.send_messages=True but
-               view_messages=False -- i.e. "muted", not fully kicked/banned),
-               and reports the full candidate list back to the Worker in a
-               single POST to /leave-report (mode=scan). The Worker then
-               asks the admin a Y/N confirm in Telegram before anything
-               actually leaves.
+  MODE=scan  - read-only. Iterates every dialog for this account and flags
+               two kinds of candidates: groups/supergroups where Telegram
+               shows this account as admin-restricted (banned_rights.
+               send_messages=True but view_messages=False -- i.e. "muted",
+               not fully kicked/banned), and (Phase 9, 2026-09-26) any
+               group/channel with fewer than MIN_MEMBERS_THRESHOLD total
+               members. Reports the full candidate list (each tagged with
+               its reason) back to the Worker in a single POST to
+               /leave-report (mode=scan). The Worker then asks the admin a
+               single Y/N confirm in Telegram covering BOTH reasons at once
+               before anything actually leaves.
 
   MODE=leave - destructive. Fetches the admin-confirmed candidate list for
                SCAN_ID from the Worker's /leave-candidates endpoint, then
@@ -70,6 +73,12 @@ LEAVE_PER_GROUP_DELAY_SECONDS = (3, 8)
 
 MAX_FLOODWAIT_AUTO_RETRY_SECONDS = 120
 
+# Phase 9 (2026-09-26): scan now also flags groups the account is a member
+# of with fewer than this many total members, in addition to muted
+# (admin-restricted) groups. Overridable via env var, same convention as
+# PEER_FLOOD_PAUSE_HOURS on the Worker side, without needing a redeploy.
+MIN_MEMBERS_THRESHOLD = int(os.environ.get("MIN_MEMBERS_THRESHOLD", "50"))
+
 # Same Cloudflare Browser Integrity Check workaround as join_telegram.py --
 # see that file's comment for the full root-cause writeup.
 REPORT_HEADERS_BASE = {
@@ -120,14 +129,50 @@ def fetch_candidates() -> list:
         return json.loads(resp.read()).get("candidates", [])
 
 
-def scan_muted_groups(client) -> tuple:
+def get_member_count(client, dialog):
+    """Cheap total-member count for a dialog. Legacy (non-channel) groups
+    already carry this on the entity for free (Chat.participants_count is
+    always populated, no extra call). Channels/supergroups often have it
+    too, but when the dialog listing didn't include it, fall back to
+    get_participants(limit=1) -- Telegram still returns the true total
+    count in that response even though only 1 row comes back, so this
+    doesn't mean downloading the whole member list."""
+    count = getattr(dialog.entity, "participants_count", None)
+    if count is not None:
+        return count
+    try:
+        return client.get_participants(dialog.entity, limit=1).total
+    except FloodWaitError as e:
+        if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
+            print(f"[scan] FloodWait {e.seconds}s too long, skipping member-count for {dialog.id}")
+            return None
+        print(f"[scan] FloodWait {e.seconds}s -- sleeping (member count check)")
+        time.sleep(e.seconds + 1)
+        try:
+            return client.get_participants(dialog.entity, limit=1).total
+        except Exception:
+            return None
+    except RPCError as e:
+        print(f"[scan] can't read member count for {dialog.id}: {type(e).__name__}")
+        return None
+
+
+def scan_leave_candidates(client) -> tuple:
     """Returns (total_groups, candidates). total_groups counts only actual
     group/supergroup/channel dialogs -- this is Telegram's own "groups and
     channels" count (the one the 500/1000 per-account limit applies to).
     iter_dialogs() returns EVERY chat in the account's chat list, including
     1:1 private chats, bots, and Saved Messages, so counting every dialog
     (the old bug) always overshoots that limit by a lot -- a scan reporting
-    more "groups" than Telegram even allows per account is the tell."""
+    more "groups" than Telegram even allows per account is the tell.
+
+    Each candidate now carries a "reason": "muted" (admin-restricted, the
+    original Phase 8 check) or "under_50_members" (Phase 9). A group is
+    reported under at most ONE reason -- if it's already muted that's the
+    one that matters (a muted group that also happens to be small doesn't
+    need a second, redundant flag), so the member-count check only runs for
+    groups that weren't already flagged as muted.
+    """
     me = client.get_me()
     total = 0
     candidates = []
@@ -140,37 +185,52 @@ def scan_muted_groups(client) -> tuple:
         if not (dialog.is_group or dialog.is_channel):
             continue
         total += 1
+
+        muted = False
         # Basic (legacy) groups don't expose per-user banned_rights the same
         # way channels/supergroups do -- dialog.is_channel is Telethon's
         # flag for "this is a Channel-type entity" and covers supergroups
         # too (megagroup=True), which is exactly what admin-restriction
         # applies to.
-        if not dialog.is_channel:
-            continue
-        try:
-            participant = client(GetParticipantRequest(dialog.entity, me.id)).participant
-        except FloodWaitError as e:
-            if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
-                print(f"[scan] FloodWait {e.seconds}s too long, skipping {dialog.id}")
+        if dialog.is_channel:
+            try:
+                participant = client(GetParticipantRequest(dialog.entity, me.id)).participant
+            except FloodWaitError as e:
+                if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
+                    print(f"[scan] FloodWait {e.seconds}s too long, skipping {dialog.id}")
+                    continue
+                print(f"[scan] FloodWait {e.seconds}s -- sleeping")
+                time.sleep(e.seconds + 1)
                 continue
-            print(f"[scan] FloodWait {e.seconds}s -- sleeping")
-            time.sleep(e.seconds + 1)
-            continue
-        except RPCError as e:
-            print(f"[scan] can't read participant status for {dialog.id}: {type(e).__name__}")
-            continue
+            except RPCError as e:
+                print(f"[scan] can't read participant status for {dialog.id}: {type(e).__name__}")
+                continue
+            else:
+                if isinstance(participant, ChannelParticipantBanned):
+                    rights = participant.banned_rights
+                    # send_messages=True + view_messages=False is Telegram's
+                    # shape for "restricted/read-only" (muted).
+                    # view_messages=True means fully banned/kicked -- a
+                    # different case, not handled here, since the account
+                    # isn't meaningfully "in" that group anymore.
+                    muted = bool(rights and rights.send_messages and not rights.view_messages)
 
-        if isinstance(participant, ChannelParticipantBanned):
-            rights = participant.banned_rights
-            # send_messages=True + view_messages=False is Telegram's shape
-            # for "restricted/read-only" (muted). view_messages=True means
-            # fully banned/kicked -- a different case, not handled here,
-            # since the account isn't meaningfully "in" that group anymore.
-            if rights and rights.send_messages and not rights.view_messages:
+        if muted:
+            candidates.append({
+                "peer_id": str(dialog.id),
+                "peer_type": "channel",
+                "title": dialog.title or "",
+                "reason": "muted",
+            })
+        else:
+            member_count = get_member_count(client, dialog)
+            if member_count is not None and member_count < MIN_MEMBERS_THRESHOLD:
                 candidates.append({
                     "peer_id": str(dialog.id),
-                    "peer_type": "channel",
+                    "peer_type": "channel" if dialog.is_channel else "chat",
                     "title": dialog.title or "",
+                    "reason": "under_50_members",
+                    "member_count": member_count,
                 })
 
         time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
@@ -241,7 +301,7 @@ def main():
     if MODE == "scan":
         try:
             with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
-                total, candidates = scan_muted_groups(client)
+                total, candidates = scan_leave_candidates(client)
         except Exception as e:
             print(f"[unexpected] scan failed: {type(e).__name__}: {e}")
             report({"mode": "scan", "account": ACCOUNT, "scan_id": SCAN_ID,

@@ -508,14 +508,17 @@ async function handleLeaveReport(request, env) {
         candidates.map((c) =>
           env.DB
             .prepare(
-              "INSERT INTO leave_candidates (scan_id, peer_id, peer_type, title, status, updated_at) VALUES (?, ?, ?, ?, 'pending', ?)"
+              "INSERT INTO leave_candidates (scan_id, peer_id, peer_type, title, reason, status, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
             )
-            .bind(scanId, String(c.peer_id), c.peer_type || "channel", c.title || "", now)
+            .bind(scanId, String(c.peer_id), c.peer_type || "channel", c.title || "", c.reason || "muted", now)
         )
       );
     }
 
     const status = candidates.length > 0 ? "awaiting_confirm" : "done";
+    // muted_count predates Phase 9 and is only ever written, never read
+    // elsewhere -- kept as the combined candidate count (muted +
+    // under_50_members) rather than adding a migration just to rename it.
     await env.DB.prepare(
       "UPDATE leave_scans SET status = ?, total_dialogs = ?, muted_count = ?, updated_at = ? WHERE id = ?"
     ).bind(status, totalDialogs, candidates.length, now, scanId).run();
@@ -523,27 +526,49 @@ async function handleLeaveReport(request, env) {
     if (candidates.length === 0) {
       await notifyAdmin(
         env,
-        `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲမှာ muted (admin-restricted) group မတွေ့ပါဘူး`
+        `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲမှာ Leave candidate (muted / 50 အောက် member) မတွေ့ပါဘူး`
       );
       return new Response("OK", { status: 200 });
     }
 
+    // Phase 9: candidates now come in two reasons -- split them for the
+    // admin instead of lumping everything under "muted" like before.
+    // Anything that isn't explicitly "under_50_members" is treated as
+    // "muted" here, matching the DB column's DEFAULT 'muted' for old rows.
+    const mutedCandidates = candidates.filter((c) => c.reason !== "under_50_members");
+    const smallGroupCandidates = candidates.filter((c) => c.reason === "under_50_members");
+
     // Show the actual group titles (not just a count) so the admin can eyeball
-    // the candidate list before confirming — capped to keep the Telegram
-    // message short even when a scan flags a large batch at once.
-    const MAX_LISTED_CANDIDATES = 15;
+    // the candidate list before confirming — capped per section to keep the
+    // Telegram message short even when a scan flags a large batch at once.
+    const MAX_LISTED_PER_SECTION = 10;
     const MAX_TITLE_LENGTH = 60;
-    const titleLines = candidates
-      .slice(0, MAX_LISTED_CANDIDATES)
-      .map((c, i) => `${i + 1}. ${(c.title || "(no title)").slice(0, MAX_TITLE_LENGTH)}`)
-      .join("\n");
-    const moreNote = candidates.length > MAX_LISTED_CANDIDATES
-      ? `\n...နောက်ထပ် ${candidates.length - MAX_LISTED_CANDIDATES} ခု`
+    const formatSection = (list) => {
+      const lines = list
+        .slice(0, MAX_LISTED_PER_SECTION)
+        .map((c, i) => {
+          const memberNote = c.reason === "under_50_members" && c.member_count != null
+            ? ` (${c.member_count} members)`
+            : "";
+          return `${i + 1}. ${(c.title || "(no title)").slice(0, MAX_TITLE_LENGTH)}${memberNote}`;
+        })
+        .join("\n");
+      const more = list.length > MAX_LISTED_PER_SECTION
+        ? `\n...နောက်ထပ် ${list.length - MAX_LISTED_PER_SECTION} ခု`
+        : "";
+      return lines + more;
+    };
+
+    const mutedSection = mutedCandidates.length
+      ? `\n\n🔇 Muted (admin-restricted) — ${mutedCandidates.length} ခု တွေ့တယ်။\n${formatSection(mutedCandidates)}`
+      : "";
+    const smallSection = smallGroupCandidates.length
+      ? `\n\n👥 50 under member — ${smallGroupCandidates.length} ခု တွေ့တယ်။\n${formatSection(smallGroupCandidates)}`
       : "";
 
     await notifyAdmin(
       env,
-      `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက muted (admin-restricted) ${candidates.length} ခု တွေ့ပါတယ်။\n\n${titleLines}${moreNote}\n\nLeave လုပ်ဖို့ Confirm ပါ 👇`,
+      `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက Leave candidate ${candidates.length} ခု တွေ့ပါတယ်။${mutedSection}${smallSection}\n\nYes ဆို ၂ မျိုးစလုံး (mute + 50 အောက်) တစ်ခါထဲ Leave မယ် — Confirm ပါ 👇`,
       {
         inline_keyboard: [
           [
