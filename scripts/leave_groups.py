@@ -121,12 +121,24 @@ def fetch_candidates() -> list:
 
 
 def scan_muted_groups(client) -> tuple:
-    """Returns (total_dialogs, candidates)."""
+    """Returns (total_groups, candidates). total_groups counts only actual
+    group/supergroup/channel dialogs -- this is Telegram's own "groups and
+    channels" count (the one the 500/1000 per-account limit applies to).
+    iter_dialogs() returns EVERY chat in the account's chat list, including
+    1:1 private chats, bots, and Saved Messages, so counting every dialog
+    (the old bug) always overshoots that limit by a lot -- a scan reporting
+    more "groups" than Telegram even allows per account is the tell."""
     me = client.get_me()
     total = 0
     candidates = []
 
     for dialog in client.iter_dialogs():
+        # dialog.is_group covers basic (legacy) groups + supergroups;
+        # dialog.is_channel covers supergroups (megagroup=True) + broadcast
+        # channels. Together they're exactly "groups and channels" --
+        # private chats/bots (is_user) and Saved Messages are excluded.
+        if not (dialog.is_group or dialog.is_channel):
+            continue
         total += 1
         # Basic (legacy) groups don't expose per-user banned_rights the same
         # way channels/supergroups do -- dialog.is_channel is Telethon's
