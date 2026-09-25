@@ -85,26 +85,22 @@ async function armDispatchPacingDelay(env, account, delayMs = randomDispatchDela
   });
 }
 
-// Phase 8 (2026-09-23): "leave muted groups" automation. Every 3 days, per
-// account, scan.yml-style scan finds groups where this account has been
-// admin-restricted ("muted", not fully kicked), asks the admin a Y/N
-// confirm in Telegram, then leave.yml actually leaves the confirmed ones.
+// Phase 8 (2026-09-23, admin-triggered as of 2026-09-26): "leave muted
+// groups" automation. Admin sends /leavescan and picks CH or JL — that scan
+// finds groups where this account has been admin-restricted ("muted", not
+// fully kicked), asks the admin a Y/N confirm in Telegram, then leave.yml
+// actually leaves the confirmed ones. No cron schedule any more — a scan
+// only ever starts because the admin asked for one.
 // leave:running:{account} is the pause flag dispatchNextQueuedJoinForAccount
 // checks below — same session used from two GitHub runners (two IPs) at
 // once risks a Telegram-side revoke, so joins and leave-runs for ONE
 // account must never overlap. CH and JL are independent sessions, so one
 // account's leave-run never pauses the other's joins.
-const LEAVE_SCAN_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000; // every 3 days, per account
 const LEAVE_SCAN_RUNNING_TTL_SECONDS = 10 * 60; // scan-phase safety cap
 const LEAVE_EXEC_RUNNING_TTL_SECONDS = 20 * 60; // leave-phase safety cap (matches leave.yml timeout-minutes)
-const MAX_LEAVE_DISPATCH_ATTEMPTS = 3; // mirrors MAX_DISPATCH_ATTEMPTS
 
 function leaveRunningKvKey(account) {
   return `leave:running:${account}`;
-}
-
-function leaveNextScanKvKey(account) {
-  return `leave:next_scan_at:${account}`;
 }
 
 export default {
@@ -136,7 +132,8 @@ export default {
     // *this* tick is never accidentally caught by the same sweep.
     await sweepStaleTriggered(env);
     await dispatchNextQueuedJoin(env);
-    await maybeTriggerLeaveScan(env);
+    // Leave-scan is no longer cron-driven — see triggerLeaveScan(), fired
+    // only from the admin's /leavescan command.
   },
 };
 
@@ -268,22 +265,25 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
   }
 }
 
-// Phase 8: fires from the same 1-min cron tick as dispatchNextQueuedJoin.
-// Cost is negligible (1-2 cheap KV reads per account when nothing is due).
-async function maybeTriggerLeaveScan(env) {
-  for (const account of ACCOUNTS) {
-    await maybeTriggerLeaveScanForAccount(env, account);
-  }
-}
-
-async function maybeTriggerLeaveScanForAccount(env, account) {
+// Fired only from the admin's /leavescan command (see handleLeaveScanCommand
+// / the leavescan: callback below) — no cron, no interval. One attempt per
+// tap: if the dispatch fails the admin just sends /leavescan again, rather
+// than a background retry loop running unattended.
+// Returns a short status code the caller turns into a Telegram reply:
+//   "running"          - a scan or leave is already in progress for this account
+//   "awaiting_confirm"  - a previous scan is still waiting on a Yes/No tap
+//   "started"           - scan.yml was dispatched successfully
+//   "dispatch_failed"   - GitHub Actions dispatch call failed
+async function triggerLeaveScan(env, account) {
   if (await env.DEDUP_KV.get(leaveRunningKvKey(account))) {
-    return; // already mid-scan or mid-leave for this account
+    return "running";
   }
-  const nextAtRaw = await env.DEDUP_KV.get(leaveNextScanKvKey(account));
-  const nextAt = nextAtRaw ? Number(nextAtRaw) : 0;
-  if (Date.now() < nextAt) {
-    return; // not due yet
+
+  const pending = await env.DB.prepare(
+    "SELECT id FROM leave_scans WHERE account = ? AND status = 'awaiting_confirm' LIMIT 1"
+  ).bind(account).first();
+  if (pending) {
+    return "awaiting_confirm";
   }
 
   const now = Date.now();
@@ -297,34 +297,12 @@ async function maybeTriggerLeaveScanForAccount(env, account) {
   });
 
   const ok = await dispatchLeaveWorkflow(env, account, "scan", scanId);
-  if (ok) {
-    // Cadence measured from scan *attempts*, not from confirm/leave timing —
-    // "every 3rd day, run this once" regardless of how long the admin takes
-    // to tap Y/N afterwards.
-    await env.DEDUP_KV.put(leaveNextScanKvKey(account), String(now + LEAVE_SCAN_INTERVAL_MS), {
-      expirationTtl: Math.ceil(LEAVE_SCAN_INTERVAL_MS / 1000) + 3600,
-    });
-    return;
-  }
+  if (ok) return "started";
 
-  // Dispatch failed — free the account back up so next minute's tick can
-  // retry, bounded by MAX_LEAVE_DISPATCH_ATTEMPTS so a GitHub-side outage
-  // doesn't hammer the API every minute forever.
   await env.DEDUP_KV.delete(leaveRunningKvKey(account));
-  const row = await env.DB.prepare("SELECT dispatch_attempts FROM leave_scans WHERE id = ?").bind(scanId).first();
-  const attempts = (row?.dispatch_attempts || 0) + 1;
-  if (attempts >= MAX_LEAVE_DISPATCH_ATTEMPTS) {
-    await env.DB.prepare(
-      "UPDATE leave_scans SET status = 'failed', dispatch_attempts = ?, updated_at = ? WHERE id = ?"
-    ).bind(attempts, Date.now(), scanId).run();
-    await env.DEDUP_KV.put(leaveNextScanKvKey(account), String(now + LEAVE_SCAN_INTERVAL_MS), {
-      expirationTtl: Math.ceil(LEAVE_SCAN_INTERVAL_MS / 1000) + 3600,
-    });
-  } else {
-    await env.DB.prepare(
-      "UPDATE leave_scans SET dispatch_attempts = ?, updated_at = ? WHERE id = ?"
-    ).bind(attempts, Date.now(), scanId).run();
-  }
+  await env.DB.prepare("UPDATE leave_scans SET status = 'failed', updated_at = ? WHERE id = ?")
+    .bind(Date.now(), scanId).run();
+  return "dispatch_failed";
 }
 
 // Kept separate from dispatchNextQueuedJoinForAccount's inline fetch call
@@ -788,6 +766,28 @@ async function handleCallbackQuery(env, cq) {
     return;
   }
 
+  if (data.startsWith("leavescan:")) {
+    const account = data.slice("leavescan:".length);
+    if (!ACCOUNTS.includes(account)) {
+      await answerCallbackQuery(env, cq.id, "⚠️ မသိတဲ့ account");
+      return;
+    }
+    const result = await triggerLeaveScan(env, account);
+    const RESULT_TEXT = {
+      running: `⏳ [${account}] Scan/Leave တစ်ခု အရင်ကတည်းက run နေပါတယ် — အဲဒါ ပြီးမှ ထပ်ခေါ်ပါ`,
+      awaiting_confirm: `⌛ [${account}] ရှေ့က scan ရလဒ်ကို Yes/No confirm မလုပ်ရသေးပါ — အဲဒီ message ပေါ်ကို အရင် action ယူပါ`,
+      started: `✅ [${account}] Scan စပါပြီ — ပြီးရင် muted group list ကို ဒီမှာ ပြောပေးပါမယ်`,
+      dispatch_failed: `⚠️ [${account}] Scan dispatch မအောင်မြင်ပါ — /leavescan ပြန်ခေါ်ကြည့်ပါ`,
+    };
+    await answerCallbackQuery(env, cq.id);
+    if (messageId) {
+      await editMessageText(env, chatId, messageId, RESULT_TEXT[result] || "⚠️ Internal error");
+    } else {
+      await replyToUser(env, chatId, RESULT_TEXT[result] || "⚠️ Internal error");
+    }
+    return;
+  }
+
   if (!data.startsWith("acct:")) {
     await answerCallbackQuery(env, cq.id);
     return;
@@ -898,6 +898,7 @@ const HELP_TEXT = [
   "Group link (တစ်ခု (သို့) [url,url,...] list) ပို့ပါ — ဘယ် account (CH / JL) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
   "",
   "/status — Queue status (account တစ်ခုချင်းစီ)",
+  "/leavescan — Muted group scan စတင်ရန် (account ရွေးပါမယ်, cron မဟုတ်ဘူး — Admin ကိုယ်တိုင် ခေါ်မှ run တယ်)",
   "/help — ဒီ message ပြန်ပြရန်",
 ].join("\n");
 
@@ -906,6 +907,10 @@ async function handleCommand(env, chatId, text) {
 
   if (cmd === "/status") {
     await replyToUser(env, chatId, await buildStatusMessage(env));
+    return;
+  }
+  if (cmd === "/leavescan") {
+    await sendLeaveScanPrompt(env, chatId);
     return;
   }
   if (cmd === "/help" || cmd === "/start") {
@@ -1058,6 +1063,26 @@ async function sendAccountPrompt(env, chatId, validCount, invalidCount) {
   });
   if (!res.ok) {
     console.error("sendAccountPrompt failed:", res.status, await res.text());
+  }
+}
+
+// /leavescan: admin-triggered replacement for the old 3-day cron. Sends the
+// same CH/JL picker style as sendAccountPrompt; the tap is read back in
+// handleCallbackQuery via the "leavescan:" prefix, not "acct:".
+async function sendLeaveScanPrompt(env, chatId) {
+  const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: "🔍 Muted group scan — ဘယ် Account ကို scan မလဲ ရွေးပါ 👇",
+      reply_markup: {
+        inline_keyboard: [ACCOUNTS.map((a) => ({ text: `Scan ${a}`, callback_data: `leavescan:${a}` }))],
+      },
+    }),
+  });
+  if (!res.ok) {
+    console.error("sendLeaveScanPrompt failed:", res.status, await res.text());
   }
 }
 
