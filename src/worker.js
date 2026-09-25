@@ -900,6 +900,21 @@ async function handleLeaveConfirmCallback(env, cq, data, chatId, messageId) {
   }
 }
 
+// Single source of truth for every admin command. /help text AND the
+// Telegram-native "/" menu (pushed via /sync_menu -> setMyCommands) both
+// read from this one list, so they can no longer drift apart like before —
+// add a command here once and both places pick it up. Telegram never syncs
+// the native menu on its own; it only ever shows whatever the last
+// setMyCommands call sent, so /sync_menu has to be re-run by hand after
+// this list changes.
+const BOT_COMMANDS = [
+  { command: "start", description: "Bot စတင်ရန် — usage message ပြရန်" },
+  { command: "status", description: "Queue status (account တစ်ခုချင်းစီ)" },
+  { command: "leavescan", description: "Muted group scan စတင်ရန် (account ရွေးရမယ်, admin ကိုယ်တိုင် ခေါ်မှ run)" },
+  { command: "sync_menu", description: "ဒီ Bot Menu ခလုတ်ကို command list အသစ်နဲ့ sync ပြန်ရန်" },
+  { command: "help", description: "ဒီ usage message ပြန်ပြရန်" },
+];
+
 const HELP_TEXT = [
   "🤖 gp-join-automation",
   "",
@@ -908,9 +923,7 @@ const HELP_TEXT = [
   "2. https://t.me/+yyyyyyyyyyyy",
   "URL ဘေးနားမှာ extra စာသား မကပ်ပါစေနဲ့ — ဘယ် account (CH / JL) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
   "",
-  "/status — Queue status (account တစ်ခုချင်းစီ)",
-  "/leavescan — Muted group scan စတင်ရန် (account ရွေးပါမယ်, cron မဟုတ်ဘူး — Admin ကိုယ်တိုင် ခေါ်မှ run တယ်)",
-  "/help — ဒီ message ပြန်ပြရန်",
+  ...BOT_COMMANDS.map((c) => `/${c.command} — ${c.description}`),
 ].join("\n");
 
 async function handleCommand(env, chatId, text) {
@@ -922,6 +935,17 @@ async function handleCommand(env, chatId, text) {
   }
   if (cmd === "/leavescan") {
     await sendLeaveScanPrompt(env, chatId);
+    return;
+  }
+  if (cmd === "/sync_menu") {
+    const ok = await syncBotCommands(env);
+    await replyToUser(
+      env,
+      chatId,
+      ok
+        ? "✅ Menu sync ပြီးပါပြီ — chat ကနေ ထွက်ပြီး ပြန်ဝင် (ဒါမှမဟုတ် app restart) လုပ်ရင် Menu ခလုတ်ထဲမှာ command list အသစ် မြင်ရပါလိမ့်မယ်"
+        : "⚠️ Menu sync မအောင်မြင်ပါ — Worker logs ထဲ setMyCommands error ကြည့်ပါ"
+    );
     return;
   }
   if (cmd === "/help" || cmd === "/start") {
@@ -1105,6 +1129,23 @@ function normalizeTelegramInviteUrl(text) {
   }
 
   return null;
+}
+
+// Pushes BOT_COMMANDS to Telegram's native "/" menu (setMyCommands). This
+// is the only thing that ever updates that menu — there is no auto-sync on
+// deploy, on purpose, so a broken command list can't ship silently. Run by
+// hand via /sync_menu whenever BOT_COMMANDS changes.
+async function syncBotCommands(env) {
+  const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/setMyCommands`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ commands: BOT_COMMANDS }),
+  });
+  if (!res.ok) {
+    console.error("setMyCommands failed:", res.status, await res.text());
+    return false;
+  }
+  return true;
 }
 
 async function replyToUser(env, chatId, text) {
