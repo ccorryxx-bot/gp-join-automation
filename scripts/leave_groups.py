@@ -166,12 +166,17 @@ def scan_leave_candidates(client) -> tuple:
     (the old bug) always overshoots that limit by a lot -- a scan reporting
     more "groups" than Telegram even allows per account is the tell.
 
-    Each candidate now carries a "reason": "muted" (admin-restricted, the
-    original Phase 8 check) or "under_50_members" (Phase 9). A group is
-    reported under at most ONE reason -- if it's already muted that's the
-    one that matters (a muted group that also happens to be small doesn't
-    need a second, redundant flag), so the member-count check only runs for
-    groups that weren't already flagged as muted.
+    Each candidate now carries a "reason", checked in this priority order
+    (a group is reported under at most ONE reason -- once one matches, the
+    rest are skipped, so a muted+small group only shows up as "muted"):
+      1. "muted"            -- admin-restricted for this account specifically
+                               (original Phase 8 check, needs an API call)
+      2. "read_only"         -- group-wide default_banned_rights.send_messages
+                               (Phase 9b, free -- already on dialog.entity)
+      3. "paid_messages"     -- send_paid_messages_stars set (Phase 9c, also
+                               free -- same entity)
+      4. "under_50_members"  -- total members below MIN_MEMBERS_THRESHOLD
+                               (Phase 9a, usually free, occasionally 1 call)
     """
     me = client.get_me()
     total = 0
@@ -223,15 +228,47 @@ def scan_leave_candidates(client) -> tuple:
                 "reason": "muted",
             })
         else:
-            member_count = get_member_count(client, dialog)
-            if member_count is not None and member_count < MIN_MEMBERS_THRESHOLD:
-                candidates.append({
+            # Phase 9b/9c (2026-09-26): messaging-restriction checks. Both
+            # fields are already present on dialog.entity from iter_dialogs()
+            # -- no extra API call, unlike the member-count fallback below --
+            # so they're checked first. Neither is knowable before joining
+            # (Telegram's pre-join invite preview, messages.checkChatInvite,
+            # doesn't expose default_banned_rights or send_paid_messages_stars
+            # at all), which is exactly why this lives in the leave-scan
+            # rather than the join step.
+            banned_rights = getattr(dialog.entity, "default_banned_rights", None)
+            stars_price = getattr(dialog.entity, "send_paid_messages_stars", None) if dialog.is_channel else None
+
+            reason = None
+            member_count = None
+            if banned_rights and banned_rights.send_messages:
+                # Admin turned off "Send Messages" for everyone (read-only
+                # group) -- not a per-user ban like the muted check above,
+                # a group-wide default.
+                reason = "read_only"
+            elif stars_price:
+                # Group requires paying stars_price Telegram Stars per
+                # message (Telegram's "Paid Messages in Groups" feature).
+                # Distinct from read_only -- sending IS possible, just not
+                # free.
+                reason = "paid_messages"
+            else:
+                member_count = get_member_count(client, dialog)
+                if member_count is not None and member_count < MIN_MEMBERS_THRESHOLD:
+                    reason = "under_50_members"
+
+            if reason:
+                candidate = {
                     "peer_id": str(dialog.id),
                     "peer_type": "channel" if dialog.is_channel else "chat",
                     "title": dialog.title or "",
-                    "reason": "under_50_members",
-                    "member_count": member_count,
-                })
+                    "reason": reason,
+                }
+                if reason == "under_50_members":
+                    candidate["member_count"] = member_count
+                elif reason == "paid_messages":
+                    candidate["stars_price"] = stars_price
+                candidates.append(candidate)
 
         time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
 

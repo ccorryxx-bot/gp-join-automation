@@ -9,7 +9,7 @@
 // gating (ADMIN_TG_ID) on every command and message this bot accepts.
 
 const KV_DEDUP_TTL_SECONDS = 600; // 10 min — covers Telegram's webhook retry window
-const REPORT_STATUSES = new Set(["joined", "already_member", "failed"]);
+const REPORT_STATUSES = new Set(["joined", "already_member", "pending_approval", "failed"]);
 
 // Add a 3rd entry here (+ its GitHub secrets + join.yml choice option) to
 // extend to another Telethon account later — everything else in this file
@@ -526,17 +526,25 @@ async function handleLeaveReport(request, env) {
     if (candidates.length === 0) {
       await notifyAdmin(
         env,
-        `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲမှာ Leave candidate (muted / 50 အောက် member) မတွေ့ပါဘူး`
+        `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲမှာ Leave candidate မတွေ့ပါဘူး`
       );
       return new Response("OK", { status: 200 });
     }
 
-    // Phase 9: candidates now come in two reasons -- split them for the
+    // Phase 9: candidates now come in up to 4 reasons -- split them for the
     // admin instead of lumping everything under "muted" like before.
-    // Anything that isn't explicitly "under_50_members" is treated as
-    // "muted" here, matching the DB column's DEFAULT 'muted' for old rows.
-    const mutedCandidates = candidates.filter((c) => c.reason !== "under_50_members");
-    const smallGroupCandidates = candidates.filter((c) => c.reason === "under_50_members");
+    // Anything unrecognized falls back to the "muted" bucket, matching the
+    // DB column's DEFAULT 'muted' for pre-Phase-9 rows.
+    const REASON_SECTIONS = [
+      { key: "muted", emoji: "🔇", label: "Muted (admin-restricted)" },
+      { key: "read_only", emoji: "🔒", label: "Read-only (sending off for everyone)" },
+      { key: "paid_messages", emoji: "⭐", label: "Paid messages (Stars per message)" },
+      { key: "under_50_members", emoji: "👥", label: "Members 50 အောက်" },
+    ];
+    const byReason = { muted: [], read_only: [], paid_messages: [], under_50_members: [] };
+    for (const c of candidates) {
+      (byReason[c.reason] || byReason.muted).push(c);
+    }
 
     // Show the actual group titles (not just a count) so the admin can eyeball
     // the candidate list before confirming — capped per section to keep the
@@ -547,10 +555,10 @@ async function handleLeaveReport(request, env) {
       const lines = list
         .slice(0, MAX_LISTED_PER_SECTION)
         .map((c, i) => {
-          const memberNote = c.reason === "under_50_members" && c.member_count != null
-            ? ` (${c.member_count} members)`
-            : "";
-          return `${i + 1}. ${(c.title || "(no title)").slice(0, MAX_TITLE_LENGTH)}${memberNote}`;
+          let note = "";
+          if (c.reason === "under_50_members" && c.member_count != null) note = ` (${c.member_count} members)`;
+          else if (c.reason === "paid_messages" && c.stars_price != null) note = ` (${c.stars_price}⭐/msg)`;
+          return `${i + 1}. ${(c.title || "(no title)").slice(0, MAX_TITLE_LENGTH)}${note}`;
         })
         .join("\n");
       const more = list.length > MAX_LISTED_PER_SECTION
@@ -559,16 +567,14 @@ async function handleLeaveReport(request, env) {
       return lines + more;
     };
 
-    const mutedSection = mutedCandidates.length
-      ? `\n\n🔇 Muted (admin-restricted) — ${mutedCandidates.length} ခု တွေ့တယ်။\n${formatSection(mutedCandidates)}`
-      : "";
-    const smallSection = smallGroupCandidates.length
-      ? `\n\n👥 50 under member — ${smallGroupCandidates.length} ခု တွေ့တယ်။\n${formatSection(smallGroupCandidates)}`
-      : "";
+    const sections = REASON_SECTIONS
+      .filter((s) => byReason[s.key].length > 0)
+      .map((s) => `\n\n${s.emoji} ${s.label} — ${byReason[s.key].length} ခု တွေ့တယ်။\n${formatSection(byReason[s.key])}`)
+      .join("");
 
     await notifyAdmin(
       env,
-      `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက Leave candidate ${candidates.length} ခု တွေ့ပါတယ်။${mutedSection}${smallSection}\n\nYes ဆို ၂ မျိုးစလုံး (mute + 50 အောက်) တစ်ခါထဲ Leave မယ် — Confirm ပါ 👇`,
+      `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက Leave candidate ${candidates.length} ခု တွေ့ပါတယ်။${sections}\n\nYes ဆို အမျိုးအစားအားလုံး တစ်ခါထဲ Leave မယ် — Confirm ပါ 👇`,
       {
         inline_keyboard: [
           [
@@ -666,6 +672,7 @@ function friendlyDetail(detail) {
 function reportMessage(status, detail) {
   if (status === "joined") return "✅ Group ထဲ join ဝင်ပြီးပါပြီ";
   if (status === "already_member") return "ℹ️ ဒီ group ထဲ join ဝင်ပြီးသားဖြစ်နေပါတယ်";
+  if (status === "pending_approval") return "🕓 Join request ပို့ပြီးပါပြီ — group admin က approve လုပ်မှ member ဖြစ်ပါမယ် (member ဖြစ်ချိန်ကို auto-detect မလုပ်နိုင်သေးပါ)";
   return `❌ Join မအောင်မြင်ပါ — ${friendlyDetail(detail)}`;
 }
 
@@ -848,6 +855,7 @@ async function handleCallbackQuery(env, cq) {
     queued: 0,
     retry_queued: 0,
     already_done: 0,
+    already_requested: 0,
     in_progress: 0,
     invalid: invalidCount || 0,
     unsupported: unsupportedCount || 0,
@@ -995,7 +1003,7 @@ async function buildStatusMessage(env) {
   for (const account of ACCOUNTS) {
     const c = byAccount[account] || {};
     lines.push(
-      `\n${account}: queued=${c.queued || 0}  triggered=${c.triggered || 0}  joined=${c.joined || 0}  already_member=${c.already_member || 0}  failed=${c.failed || 0}`
+      `\n${account}: queued=${c.queued || 0}  triggered=${c.triggered || 0}  joined=${c.joined || 0}  already_member=${c.already_member || 0}  pending_approval=${c.pending_approval || 0}  failed=${c.failed || 0}`
     );
   }
   return lines.join("\n");
@@ -1025,6 +1033,15 @@ async function enqueueOneUrl(env, chatId, normalized, now, account) {
 
   if (existing.last_status === "joined" || existing.last_status === "already_member") {
     return "already_done";
+  }
+
+  // A join request is already sitting with that group's admins -- sending
+  // another one would just get INVITE_REQUEST_SENT again for no benefit,
+  // so this is skipped like already_done, but tracked under its own outcome
+  // so the admin sees "awaiting approval" rather than a misleading "already
+  // joined".
+  if (existing.last_status === "pending_approval") {
+    return "already_requested";
   }
 
   if (existing.last_status === "queued" || existing.last_status === "triggered") {
@@ -1066,7 +1083,7 @@ function buildNoValidLinksMessage(unsupportedCount) {
 // One summary reply per incoming message instead of one reply per URL --
 // a 10-link batch shouldn't produce 10 separate Telegram messages.
 function buildIntakeSummary(tally, totalEntries) {
-  const handled = tally.queued + tally.retry_queued + tally.already_done + tally.in_progress;
+  const handled = tally.queued + tally.retry_queued + tally.already_done + tally.already_requested + tally.in_progress;
   if (totalEntries === 0 || (handled === 0 && tally.invalid + tally.unsupported === totalEntries)) {
     return buildNoValidLinksMessage(tally.unsupported);
   }
@@ -1075,6 +1092,7 @@ function buildIntakeSummary(tally, totalEntries) {
   if (tally.queued) lines.push(`✅ Queue ထဲ ထည့်ပြီးပါပြီ — ${tally.queued} link`);
   if (tally.retry_queued) lines.push(`🔁 ပြန်ကြိုးစားမည် (အရင်တစ်ခါ fail ဖြစ်ခဲ့တာ) — ${tally.retry_queued} link`);
   if (tally.already_done) lines.push(`⏭️ Skip (join ဝင်ပြီးသား) — ${tally.already_done} link`);
+  if (tally.already_requested) lines.push(`🕓 Skip (join request ပို့ပြီးသား — admin approval စောင့်နေဆဲ) — ${tally.already_requested} link`);
   if (tally.in_progress) lines.push(`⏳ Skip (queue ထဲမှာ လုပ်ဆောင်နေဆဲ) — ${tally.in_progress} link`);
   if (tally.invalid) lines.push(`❌ Link format မမှန်လို့ ကျော်လိုက်ပါတယ် — ${tally.invalid} link`);
   if (tally.unsupported) lines.push(`🚫 t.me/c/... link — auto-join မရပါ — ${tally.unsupported} link`);

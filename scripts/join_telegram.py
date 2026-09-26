@@ -39,6 +39,7 @@ from telethon.errors import (
     FloodWaitError,
     InviteHashExpiredError,
     InviteHashInvalidError,
+    InviteRequestSentError,
     PeerFloodError,
     RPCError,
     UserAlreadyParticipantError,
@@ -162,6 +163,19 @@ def join_with_floodwait_handling(client, kind, identifier):
             return "joined", ""
         except UserAlreadyParticipantError:
             return "already_member", ""
+        except InviteRequestSentError:
+            # The group has "Approve new members" on. The join REQUEST was
+            # sent successfully -- this account is NOT a member yet and
+            # won't be until an admin on that group approves it (could be
+            # minutes, days, or never). This is a real, distinct outcome:
+            # calling it "failed" (the old behavior, since this is itself an
+            # RPCError subclass and fell into the generic handler below)
+            # wastes a retry every cycle re-sending a request that's already
+            # pending, and calling it "joined" would be worse -- the Worker
+            # would treat this group as safe to scan/leave when the account
+            # was never actually let in. Must be caught BEFORE the generic
+            # RPCError handler below for the same reason PeerFloodError is.
+            return "pending_approval", ""
         except FloodWaitError as e:
             attempt += 1
             if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS or attempt > MAX_FLOODWAIT_RETRIES:
