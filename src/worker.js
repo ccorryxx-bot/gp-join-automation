@@ -204,7 +204,7 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
     await env.DB.prepare(
       "UPDATE join_queue SET status = 'failed', detail = ?, updated_at = ? WHERE id = ?"
     ).bind("denormalize_failed", Date.now(), row.id).run();
-    await replyToUser(env, row.chat_id, reportMessage("failed", "denormalize_failed"));
+    await replyToUser(env, row.chat_id, reportMessage("failed", "denormalize_failed", row.url_normalized));
     return;
   }
 
@@ -256,7 +256,7 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
     await env.DB.prepare(
       "UPDATE join_queue SET status = 'failed', detail = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ?"
     ).bind(`github_dispatch_failed:${dispatchErrText}`.slice(0, 200), attempts, Date.now(), row.id).run();
-    await replyToUser(env, row.chat_id, reportMessage("failed", "github_dispatch_failed"));
+    await replyToUser(env, row.chat_id, reportMessage("failed", "github_dispatch_failed", row.url_normalized));
   } else {
     // Still under budget — stays 'queued', next tick retries automatically.
     await env.DB.prepare(
@@ -339,7 +339,7 @@ async function dispatchLeaveWorkflow(env, account, mode, scanId) {
 async function sweepStaleTriggered(env) {
   const cutoff = Date.now() - STALE_TRIGGERED_TIMEOUT_MS;
   const { results } = await env.DB.prepare(
-    "SELECT id, chat_id, account FROM join_queue WHERE status = 'triggered' AND updated_at < ?"
+    "SELECT id, chat_id, account, url_normalized FROM join_queue WHERE status = 'triggered' AND updated_at < ?"
   ).bind(cutoff).all();
 
   for (const row of results) {
@@ -347,7 +347,7 @@ async function sweepStaleTriggered(env) {
       "UPDATE join_queue SET status = 'failed', detail = 'stale_no_report_timeout', updated_at = ? WHERE id = ?"
     ).bind(Date.now(), row.id).run();
     await armDispatchPacingDelay(env, row.account);
-    await replyToUser(env, row.chat_id, reportMessage("failed", "stale_no_report_timeout"));
+    await replyToUser(env, row.chat_id, reportMessage("failed", "stale_no_report_timeout", row.url_normalized));
   }
 }
 
@@ -439,7 +439,7 @@ async function handleReport(request, env) {
   const isPeerFlood = detail === "peer_flood_detected";
   await armDispatchPacingDelay(env, row.account, isPeerFlood ? peerFloodPauseMs(env) : undefined);
 
-  await replyToUser(env, row.chat_id, reportMessage(status, detail));
+  await replyToUser(env, row.chat_id, reportMessage(status, detail, row.url_normalized));
 
   return new Response("OK", { status: 200 });
 }
@@ -669,11 +669,16 @@ function friendlyDetail(detail) {
   return match ? `${match[1]} [${detail}]` : detail;
 }
 
-function reportMessage(status, detail) {
+function reportMessage(status, detail, url) {
   if (status === "joined") return "✅ Group ထဲ join ဝင်ပြီးပါပြီ";
   if (status === "already_member") return "ℹ️ ဒီ group ထဲ join ဝင်ပြီးသားဖြစ်နေပါတယ်";
   if (status === "pending_approval") return "🕓 Join request ပို့ပြီးပါပြီ — group admin က approve လုပ်မှ member ဖြစ်ပါမယ် (member ဖြစ်ချိန်ကို auto-detect မလုပ်နိုင်သေးပါ)";
-  return `❌ Join မအောင်မြင်ပါ — ${friendlyDetail(detail)}`;
+  // Failed: show the actual URL alongside the reason so the admin can open
+  // it themselves and check whether it's really a dead/invalid link, or
+  // something else (Telegram-side hiccup, a transient RPC error, etc.)
+  // mislabeled by the reason code.
+  const urlLine = url ? `\n\n${url}` : "";
+  return `❌ Join မအောင်မြင်ပါ — ${friendlyDetail(detail)}${urlLine}`;
 }
 
 async function handleTelegramWebhook(request, env, ctx) {
