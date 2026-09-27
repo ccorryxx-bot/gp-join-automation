@@ -20,6 +20,20 @@ Phase 8 (2026-09-23): "leave muted groups" automation, invoked by
                between calls, and reports the full per-group result list
                back in a single POST to /leave-report (mode=leave).
 
+  MODE=status - read-only. Phase 11 (2026-09-28), invoked by the admin's
+               /account_status bot command. Same dialog walk as MODE=scan's
+               muted/read_only/paid_messages checks, but every group lands
+               in exactly one bucket (total / active / restricted /
+               paid_messages / read_only) instead of building a leave
+               candidate list, and the member-count fallback is skipped
+               entirely -- it's the one check in MODE=scan that can cost an
+               extra get_participants call per group, and /account_status
+               has no use for that number. Reports the five counts back in
+               a single POST to /leave-report (mode=status). SCAN_ID is
+               unused here (no leave_scans row exists for a status run --
+               nothing to confirm or leave later) but still required/sent
+               for a consistent report payload shape across modes.
+
 Env vars (required): TG_API_ID, TG_API_HASH, TG_SESSION_STRING, ACCOUNT,
 MODE, SCAN_ID -- see leave.yml for where these come from.
 
@@ -275,6 +289,76 @@ def scan_leave_candidates(client) -> tuple:
     return total, candidates
 
 
+def scan_account_status(client) -> dict:
+    """Phase 11 (2026-09-28): read-only group-count snapshot for the
+    /account_status bot command. Same detection order as
+    scan_leave_candidates (muted > read_only > paid_messages), but every
+    group lands in exactly one bucket and there's no under_50_members
+    check -- that's the only path in scan_leave_candidates that can cost an
+    extra API call (get_participants(limit=1) fallback), and this command
+    has no use for a member count, so status mode never makes that call.
+    The GetParticipantRequest for the muted check is still one call per
+    channel/supergroup dialog -- unavoidable, it's the only way Telegram
+    exposes per-account admin restriction.
+    """
+    me = client.get_me()
+    total = 0
+    active = 0
+    restricted = 0
+    paid_messages = 0
+    read_only = 0
+
+    for dialog in client.iter_dialogs():
+        if not (dialog.is_group or dialog.is_channel):
+            continue
+        total += 1
+
+        muted = False
+        if dialog.is_channel:
+            try:
+                participant = client(GetParticipantRequest(dialog.entity, me.id)).participant
+            except FloodWaitError as e:
+                if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
+                    print(f"[status] FloodWait {e.seconds}s too long, skipping {dialog.id}")
+                    continue
+                print(f"[status] FloodWait {e.seconds}s -- sleeping")
+                time.sleep(e.seconds + 1)
+                continue
+            except RPCError as e:
+                print(f"[status] can't read participant status for {dialog.id}: {type(e).__name__}")
+                continue
+            else:
+                if isinstance(participant, ChannelParticipantBanned):
+                    rights = participant.banned_rights
+                    muted = bool(rights and rights.send_messages and not rights.view_messages)
+
+        if muted:
+            restricted += 1
+        else:
+            # Both fields are already on dialog.entity from iter_dialogs()
+            # -- free, same as scan_leave_candidates's read_only/paid_messages
+            # checks -- no extra call for either.
+            banned_rights = getattr(dialog.entity, "default_banned_rights", None)
+            stars_price = getattr(dialog.entity, "send_paid_messages_stars", None) if dialog.is_channel else None
+
+            if banned_rights and banned_rights.send_messages:
+                read_only += 1
+            elif stars_price:
+                paid_messages += 1
+            else:
+                active += 1
+
+        time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
+
+    return {
+        "total": total,
+        "active": active,
+        "restricted": restricted,
+        "paid_messages": paid_messages,
+        "read_only": read_only,
+    }
+
+
 def leave_confirmed_groups(client, candidates: list) -> tuple:
     """Returns (results, aborted_early)."""
     # get_entity(int_id) alone can fail to resolve a channel in a *fresh*
@@ -374,6 +458,21 @@ def main():
 
         if not report({"mode": "leave", "account": ACCOUNT, "scan_id": SCAN_ID,
                         "results": results, "aborted_early": aborted_early}):
+            sys.exit(1)
+        return
+
+    if MODE == "status":
+        try:
+            with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
+                counts = scan_account_status(client)
+        except Exception as e:
+            print(f"[unexpected] status scan failed: {type(e).__name__}: {e}")
+            report({"mode": "status", "account": ACCOUNT, "scan_id": SCAN_ID,
+                     "total": 0, "active": 0, "restricted": 0,
+                     "paid_messages": 0, "read_only": 0})
+            sys.exit(1)
+
+        if not report({"mode": "status", "account": ACCOUNT, "scan_id": SCAN_ID, **counts}):
             sys.exit(1)
         return
 

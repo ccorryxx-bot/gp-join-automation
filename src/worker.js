@@ -317,6 +317,37 @@ async function triggerLeaveScan(env, account) {
   return "dispatch_failed";
 }
 
+// Phase 11 (2026-09-28): /account_status — a read-only per-account group
+// count (total / active / restricted / paid-message / read-only), reusing
+// leave.yml's account + Telethon session with mode="status" (see
+// scan_account_status in scripts/leave_groups.py). No leave_scans row is
+// created here, unlike triggerLeaveScan — a status run is fully stateless
+// (nothing to confirm, nothing to leave later), so there's nothing to
+// persist beyond this short-lived "already running" guard, which exists
+// only to give a friendly reply on a double-tap rather than silently
+// queuing a second GitHub run behind the first (the leave.yml concurrency
+// group would queue it anyway, but the admin gets no feedback either way).
+const STATUS_RUNNING_TTL_SECONDS = 10 * 60; // matches leave-scan's scan-phase cap
+
+function statusRunningKvKey(account) {
+  return `status:running:${account}`;
+}
+
+async function triggerAccountStatus(env, account) {
+  if (await env.DEDUP_KV.get(statusRunningKvKey(account))) {
+    return "running";
+  }
+  await env.DEDUP_KV.put(statusRunningKvKey(account), "1", {
+    expirationTtl: STATUS_RUNNING_TTL_SECONDS,
+  });
+
+  const ok = await dispatchLeaveWorkflow(env, account, "status", 0);
+  if (ok) return "started";
+
+  await env.DEDUP_KV.delete(statusRunningKvKey(account));
+  return "dispatch_failed";
+}
+
 // Kept separate from dispatchNextQueuedJoinForAccount's inline fetch call
 // rather than unified into one shared helper — that function is already
 // live/tested in production; not touching it for a DRY-only change.
@@ -515,6 +546,30 @@ async function handleLeaveReport(request, env) {
   // pause before doing anything else so a slow D1/Telegram call below never
   // extends the join-pause past what actually happened on GitHub's side.
   await env.DEDUP_KV.delete(leaveRunningKvKey(account));
+
+  if (mode === "status") {
+    // Own KV key (not leaveRunningKvKey) — a status run never pauses joins,
+    // so it doesn't touch that flag; the delete above is a harmless no-op
+    // for this mode.
+    await env.DEDUP_KV.delete(statusRunningKvKey(account));
+
+    const total = Number(body.total) || 0;
+    const active = Number(body.active) || 0;
+    const restricted = Number(body.restricted) || 0;
+    const paidMessages = Number(body.paid_messages) || 0;
+    const readOnly = Number(body.read_only) || 0;
+
+    await notifyAdmin(
+      env,
+      `🏁 [${account}] ပြီးသွားပါပြီ!\n\n` +
+        `Total groups - ${total}\n` +
+        `active groups - ${active}\n` +
+        `restricted groups - ${restricted}\n` +
+        `paid message groups - ${paidMessages}\n` +
+        `read only groups - ${readOnly}`
+    );
+    return new Response("OK", { status: 200 });
+  }
 
   if (mode === "scan") {
     const candidates = Array.isArray(body.candidates) ? body.candidates : [];
@@ -971,6 +1026,35 @@ async function handleCallbackQuery(env, cq) {
     return;
   }
 
+  if (data.startsWith("acctstatus:")) {
+    const choice = data.slice("acctstatus:".length);
+    const accountsToRun = choice === "BOTH" ? ACCOUNTS : ACCOUNTS.includes(choice) ? [choice] : null;
+    if (!accountsToRun) {
+      await answerCallbackQuery(env, cq.id, "⚠️ မသိတဲ့ account");
+      return;
+    }
+
+    const RESULT_TEXT = {
+      running: (a) => `⏳ [${a}] Status scan အရင်ကတည်းက run နေပါတယ်`,
+      started: (a) => `✅ [${a}] Status scan စပါပြီ`,
+      dispatch_failed: (a) => `⚠️ [${a}] Dispatch မအောင်မြင်ပါ — ပြန်ခေါ်ကြည့်ပါ`,
+    };
+    const lines = [];
+    for (const acc of accountsToRun) {
+      const result = await triggerAccountStatus(env, acc);
+      lines.push(RESULT_TEXT[result](acc));
+    }
+
+    await answerCallbackQuery(env, cq.id);
+    const summary = lines.join("\n");
+    if (messageId) {
+      await editMessageText(env, chatId, messageId, summary);
+    } else {
+      await replyToUser(env, chatId, summary);
+    }
+    return;
+  }
+
   if (!data.startsWith("acct:")) {
     await answerCallbackQuery(env, cq.id);
     return;
@@ -1122,6 +1206,7 @@ const BOT_COMMANDS = [
   { command: "start", description: "Bot စတင်ရန် — usage message ပြရန်" },
   { command: "status", description: "Queue status (account တစ်ခုချင်းစီ)" },
   { command: "leavescan", description: "Muted group scan စတင်ရန် (account ရွေးရမယ်, admin ကိုယ်တိုင် ခေါ်မှ run)" },
+  { command: "account_status", description: "Account status — Total/active/restricted/paid/read-only group count (account ရွေးရမယ်)" },
   { command: "sync_menu", description: "ဒီ Bot Menu ခလုတ်ကို command list အသစ်နဲ့ sync ပြန်ရန်" },
   { command: "help", description: "ဒီ usage message ပြန်ပြရန်" },
 ];
@@ -1146,6 +1231,10 @@ async function handleCommand(env, chatId, text) {
   }
   if (cmd === "/leavescan") {
     await sendLeaveScanPrompt(env, chatId);
+    return;
+  }
+  if (cmd === "/account_status") {
+    await sendAccountStatusPrompt(env, chatId);
     return;
   }
   if (cmd === "/sync_menu") {
@@ -1428,6 +1517,32 @@ async function sendLeaveScanPrompt(env, chatId) {
   });
   if (!res.ok) {
     console.error("sendLeaveScanPrompt failed:", res.status, await res.text());
+  }
+}
+
+// /account_status: same CH/JL picker style as sendLeaveScanPrompt, plus a
+// 3rd "Both" option that fires the status scan for both accounts at once.
+// There's no merged/combined count — each account still reports back (and
+// gets its own Telegram message) independently, same as two separate taps.
+async function sendAccountStatusPrompt(env, chatId) {
+  const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: "📊 Account status — ဘယ် Account ကို check မလဲ ရွေးပါ 👇",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            ...ACCOUNTS.map((a) => ({ text: `Status ${a}`, callback_data: `acctstatus:${a}` })),
+            { text: "Status Both", callback_data: "acctstatus:BOTH" },
+          ],
+        ],
+      },
+    }),
+  });
+  if (!res.ok) {
+    console.error("sendAccountStatusPrompt failed:", res.status, await res.text());
   }
 }
 

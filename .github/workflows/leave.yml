@@ -11,12 +11,13 @@ on:
           - JL
         default: CH
       mode:
-        description: "scan (read-only check) or leave (actually leave confirmed groups)"
+        description: "scan (read-only check), leave (actually leave confirmed groups), or status (read-only group-count snapshot for /account_status)"
         required: true
         type: choice
         options:
           - scan
           - leave
+          - status
         default: scan
       scan_id:
         description: "leave_scans.id this run belongs to (set by the Worker)"

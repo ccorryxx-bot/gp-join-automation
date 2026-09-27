@@ -27,6 +27,7 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 8 - leave muted/admin-restricted groups automation (repurposed from the original "production cutover" plan — see leave.yml)
 - [x] Phase 9 - leave-scan also flags low-member (<50) groups; request-to-join + read-only/paid-message group detection (9d)
 - [x] Phase 10 - batched join notifications (2026-09-28) — see below
+- [x] Phase 11 - `/account_status` command — per-account group-count snapshot (2026-09-28) — see below
 
 ## Bulk-URL intake (added 2026-09-22)
 
@@ -137,6 +138,36 @@ a whole gets exactly **two** messages regardless of size:
 A row with no `batch_id` (only possible for a pre-Phase-10 row still
 in-flight at deploy time) transparently falls back to the old
 one-message-per-row behavior for just that row.
+
+## `/account_status` command (added 2026-09-28, Phase 11)
+
+Admin-only, read-only group-count snapshot per account. `/account_status`
+prompts CH / JL / Both (same inline-keyboard style as `/leavescan`), then
+dispatches `leave.yml` with `mode: status` for each chosen account —
+`scripts/leave_groups.py`'s `scan_account_status()` reuses the same
+muted/read-only/paid-messages detection `scan_leave_candidates()` already
+had for the leave-scan flow, but every group lands in exactly one bucket
+instead of building a leave-candidate list, and the member-count fallback
+(the one check that could cost an extra `get_participants` call per group)
+is skipped entirely, since this command has no use for it. Reports back to
+`/leave-report` (`mode: status`) once per account run:
+
+```
+🏁 [CH] ပြီးသွားပါပြီ!
+
+Total groups - 42
+active groups - 35
+restricted groups - 2
+paid message groups - 1
+read only groups - 4
+```
+
+"Both" dispatches CH and JL independently — each still gets its own
+message when its own run finishes, there's no merged/combined count.
+Stateless by design: unlike `/leavescan`, nothing is written to D1 for a
+status run (no `leave_scans` row) — there's nothing to confirm or act on
+later, so there's nothing to persist beyond a short-lived
+`status:running:{account}` KV guard against a double-tap.
 
 ## Live Verification Log
 
