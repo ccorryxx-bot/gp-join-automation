@@ -7,6 +7,11 @@
 // account picker before queueing, per-account dedup/dispatch/pacing so both
 // accounts can join in parallel without blocking each other, and admin-only
 // gating (ADMIN_TG_ID) on every command and message this bot accepts.
+// Phase 10 (2026-09-28): batched notifications — every join_queue row
+// created by one account-picker tap shares a batch_id (join_batches table).
+// Instead of one "in progress" + one result message PER URL, each batch now
+// gets exactly one "in progress" message and one final count summary,
+// however many URLs it contains — see notifyBatchStarted/resolveBatchForRow.
 
 const KV_DEDUP_TTL_SECONDS = 600; // 10 min — covers Telegram's webhook retry window
 const REPORT_STATUSES = new Set(["joined", "already_member", "pending_approval", "failed"]);
@@ -190,7 +195,7 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
   if (Date.now() < nextAllowedAt) return; // still inside the 1-3 min cooldown
 
   const row = await env.DB.prepare(
-    "SELECT id, chat_id, url_normalized, dispatch_attempts FROM join_queue WHERE account = ? AND status = 'queued' ORDER BY created_at ASC LIMIT 1"
+    "SELECT id, chat_id, url_normalized, dispatch_attempts, batch_id FROM join_queue WHERE account = ? AND status = 'queued' ORDER BY created_at ASC LIMIT 1"
   ).bind(account).first();
 
   // Nothing queued for this account: no special state to reset — the moment
@@ -204,7 +209,10 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
     await env.DB.prepare(
       "UPDATE join_queue SET status = 'failed', detail = ?, updated_at = ? WHERE id = ?"
     ).bind("denormalize_failed", Date.now(), row.id).run();
-    await replyToUser(env, row.chat_id, reportMessage("failed", "denormalize_failed", row.url_normalized));
+    await resolveBatchForRow(env, row.batch_id, row.chat_id, account, "failed");
+    if (!row.batch_id) {
+      await replyToUser(env, row.chat_id, reportMessage("failed", "denormalize_failed", row.url_normalized));
+    }
     return;
   }
 
@@ -240,7 +248,8 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
     ).bind(Date.now(), row.id).run();
     // Immediate feedback — the user's last message was "✅ Queued" up to ~60s
     // ago; without this, the chat looks dead until the Action finishes.
-    await replyToUser(env, row.chat_id, `🔄 [${account}] လုပ်ဆောင်နေပါပြီ — Group ထဲ join ဝင်ဖို့ ကြိုးစားနေပါတယ်...`);
+    // Phase 10: sent ONCE per batch (guarded inside), not once per row.
+    await notifyBatchStarted(env, row.batch_id, row.chat_id, account);
     return;
   }
 
@@ -256,7 +265,10 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
     await env.DB.prepare(
       "UPDATE join_queue SET status = 'failed', detail = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ?"
     ).bind(`github_dispatch_failed:${dispatchErrText}`.slice(0, 200), attempts, Date.now(), row.id).run();
-    await replyToUser(env, row.chat_id, reportMessage("failed", "github_dispatch_failed", row.url_normalized));
+    await resolveBatchForRow(env, row.batch_id, row.chat_id, account, "failed");
+    if (!row.batch_id) {
+      await replyToUser(env, row.chat_id, reportMessage("failed", "github_dispatch_failed", row.url_normalized));
+    }
   } else {
     // Still under budget — stays 'queued', next tick retries automatically.
     await env.DB.prepare(
@@ -339,7 +351,7 @@ async function dispatchLeaveWorkflow(env, account, mode, scanId) {
 async function sweepStaleTriggered(env) {
   const cutoff = Date.now() - STALE_TRIGGERED_TIMEOUT_MS;
   const { results } = await env.DB.prepare(
-    "SELECT id, chat_id, account, url_normalized FROM join_queue WHERE status = 'triggered' AND updated_at < ?"
+    "SELECT id, chat_id, account, url_normalized, batch_id FROM join_queue WHERE status = 'triggered' AND updated_at < ?"
   ).bind(cutoff).all();
 
   for (const row of results) {
@@ -347,7 +359,10 @@ async function sweepStaleTriggered(env) {
       "UPDATE join_queue SET status = 'failed', detail = 'stale_no_report_timeout', updated_at = ? WHERE id = ?"
     ).bind(Date.now(), row.id).run();
     await armDispatchPacingDelay(env, row.account);
-    await replyToUser(env, row.chat_id, reportMessage("failed", "stale_no_report_timeout", row.url_normalized));
+    await resolveBatchForRow(env, row.batch_id, row.chat_id, row.account, "failed");
+    if (!row.batch_id) {
+      await replyToUser(env, row.chat_id, reportMessage("failed", "stale_no_report_timeout", row.url_normalized));
+    }
   }
 }
 
@@ -407,7 +422,7 @@ async function handleReport(request, env) {
   }
 
   const row = await env.DB.prepare(
-    "SELECT chat_id, url_normalized, account, status AS current_status FROM join_queue WHERE id = ?"
+    "SELECT chat_id, url_normalized, account, status AS current_status, batch_id FROM join_queue WHERE id = ?"
   ).bind(id).first();
 
   if (!row) {
@@ -439,7 +454,10 @@ async function handleReport(request, env) {
   const isPeerFlood = detail === "peer_flood_detected";
   await armDispatchPacingDelay(env, row.account, isPeerFlood ? peerFloodPauseMs(env) : undefined);
 
-  await replyToUser(env, row.chat_id, reportMessage(status, detail, row.url_normalized));
+  await resolveBatchForRow(env, row.batch_id, row.chat_id, row.account, status);
+  if (!row.batch_id) {
+    await replyToUser(env, row.chat_id, reportMessage(status, detail, row.url_normalized));
+  }
 
   return new Response("OK", { status: 200 });
 }
@@ -681,6 +699,133 @@ function reportMessage(status, detail, url) {
   return `❌ Join မအောင်မြင်ပါ — ${friendlyDetail(detail)}${urlLine}`;
 }
 
+// Phase 10: sends the ONE "in progress" message for a batch — guarded by
+// join_batches.progress_notified so a 10-row batch fires this exactly once
+// (on whichever row happens to dispatch first), not once per row. Captures
+// the sent message's id as progress_message_id so the final summary can
+// EDIT this same message in place instead of sending a second one, matching
+// the editMessageText pattern already used for the account-picker prompt.
+async function notifyBatchStarted(env, batchId, chatId, account) {
+  const text = `🔄 [${account}] လုပ်ဆောင်နေပါပြီ — Group ထဲ join ဝင်ဖို့ ကြိုးစားနေပါတယ်...`;
+
+  if (!batchId) {
+    // No batch (pre-Phase-10 row still in flight at deploy time) — fall
+    // back to the old per-row behavior rather than silently dropping it.
+    await replyToUser(env, chatId, text);
+    return;
+  }
+
+  const batch = await env.DB.prepare(
+    "SELECT progress_notified FROM join_batches WHERE id = ?"
+  ).bind(batchId).first();
+  if (!batch || batch.progress_notified) return; // already notified, or batch row missing
+
+  // Claim the flag BEFORE sending — two rows from the same batch can both
+  // hit dispatchNextQueuedJoinForAccount around the same cron tick (one per
+  // account lane), so this closes the race that a claim-after-send would
+  // leave open.
+  const claimed = await env.DB.prepare(
+    "UPDATE join_batches SET progress_notified = 1, updated_at = ? WHERE id = ? AND progress_notified = 0"
+  ).bind(Date.now(), batchId).run();
+  if (!claimed.meta.changes) return; // another row already claimed it first
+
+  const messageId = await replyToUser(env, chatId, text);
+  if (messageId) {
+    await env.DB.prepare("UPDATE join_batches SET progress_message_id = ? WHERE id = ?")
+      .bind(messageId, batchId).run();
+  }
+}
+
+// Phase 10: rolls one row's final outcome into its batch's counters. When
+// every row belonging to the batch has resolved (resolved_count reaches
+// to_process), sends the ONE final summary — no matter how many URLs the
+// batch contained, this fires exactly once.
+async function resolveBatchForRow(env, batchId, chatId, account, status) {
+  if (!batchId) return; // caller falls back to a direct per-row message
+
+  const COLUMN_BY_STATUS = {
+    joined: "joined_count",
+    already_member: "already_member_count",
+    pending_approval: "pending_approval_count",
+    failed: "failed_count",
+  };
+  const column = COLUMN_BY_STATUS[status];
+  if (!column) return; // unrecognized status — shouldn't happen, REPORT_STATUSES already filters this
+
+  await env.DB.prepare(
+    `UPDATE join_batches SET resolved_count = resolved_count + 1, ${column} = ${column} + 1, updated_at = ? WHERE id = ?`
+  ).bind(Date.now(), batchId).run();
+
+  const batch = await env.DB.prepare("SELECT * FROM join_batches WHERE id = ?").bind(batchId).first();
+  if (!batch || batch.status === "done" || batch.resolved_count < batch.to_process) return;
+
+  // Claim the completion the same way notifyBatchStarted claims its flag —
+  // the last two rows of a batch can resolve on nearly the same tick.
+  const claimed = await env.DB.prepare(
+    "UPDATE join_batches SET status = 'done', updated_at = ? WHERE id = ? AND status != 'done'"
+  ).bind(Date.now(), batchId).run();
+  if (!claimed.meta.changes) return; // another row already finalized this batch
+
+  await sendBatchSummary(env, batch);
+}
+
+// Phase 10: the one final message per batch. Edits the "in progress"
+// message in place when one was sent (the normal case); falls back to a
+// fresh message if the batch finished without ever dispatching one (e.g.
+// every row in the batch failed the GitHub dispatch itself).
+async function sendBatchSummary(env, batch) {
+  const alreadyJoined = (batch.already_joined_before || 0) + (batch.already_member_count || 0);
+  const pendingApproval = (batch.already_requested_before || 0) + (batch.pending_approval_count || 0);
+
+  const lines = [
+    `🏁 [${batch.account}] ပြီးသွားပါပြီ!`,
+    "",
+    `Total Url - ${batch.total_entries}`,
+    `Already joined - ${alreadyJoined}`,
+    `Join Success - ${batch.joined_count || 0}`,
+    `Join Failed - ${batch.failed_count || 0}`,
+    `Invalid - ${batch.invalid_count || 0}`,
+  ];
+
+  const extras = [];
+  if (pendingApproval) extras.push(`🕓 Approval စောင့်နေဆဲ - ${pendingApproval}`);
+  if (batch.unsupported_count) extras.push(`🚫 auto-join မရတဲ့ format (t.me/c/...) - ${batch.unsupported_count}`);
+  if (batch.in_progress_skip) extras.push(`⏳ တခြား queue ထဲမှာ လုပ်ဆောင်နေဆဲမို့ skip - ${batch.in_progress_skip}`);
+  if (extras.length) {
+    lines.push("", ...extras);
+  }
+
+  // Failed URLs specifically are worth listing (not just a count) so the
+  // admin can tell "dead invite link" apart from "Telegram hiccup" without
+  // digging through Action logs — same reasoning as reportMessage()
+  // including the URL for a single failure, capped like handleLeaveReport's
+  // formatSection so a big failed batch still fits in one message.
+  if (batch.failed_count > 0) {
+    const MAX_LISTED = 10;
+    const { results } = await env.DB.prepare(
+      "SELECT url_normalized, detail FROM join_queue WHERE batch_id = ? AND status = 'failed' ORDER BY updated_at ASC LIMIT ?"
+    ).bind(batch.id, MAX_LISTED).all();
+    if (results?.length) {
+      lines.push("", "❌ Fail ဖြစ်တဲ့ link တွေ:");
+      for (const r of results) {
+        const url = denormalizeToJoinUrl(r.url_normalized) || r.url_normalized;
+        lines.push(`• ${url} — ${friendlyDetail(r.detail)}`);
+      }
+      if (batch.failed_count > results.length) {
+        lines.push(`...နောက်ထပ် ${batch.failed_count - results.length} ခု`);
+      }
+    }
+  }
+
+  const text = lines.join("\n");
+
+  if (batch.progress_message_id) {
+    await editMessageText(env, batch.chat_id, batch.progress_message_id, text);
+  } else {
+    await replyToUser(env, batch.chat_id, text);
+  }
+}
+
 async function handleTelegramWebhook(request, env, ctx) {
   const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
   if (incomingSecret !== env.TG_WEBHOOK_SECRET) {
@@ -856,6 +1001,17 @@ async function handleCallbackQuery(env, cq) {
 
   const { urls, invalidCount, unsupportedCount } = pending;
   const now = Date.now();
+  const totalEntries = urls.length + (invalidCount || 0) + (unsupportedCount || 0);
+
+  // Phase 10: create the batch row up front so enqueueOneUrl can tag every
+  // new join_queue row it inserts with this batchId — that's what lets the
+  // "in progress" and final summary messages later be sent ONCE for the
+  // whole batch instead of once per URL.
+  const batchInsert = await env.DB.prepare(
+    "INSERT INTO join_batches (chat_id, account, total_entries, invalid_count, unsupported_count, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)"
+  ).bind(String(chatId), account, totalEntries, invalidCount || 0, unsupportedCount || 0, now, now).run();
+  const batchId = batchInsert.meta.last_row_id;
+
   const tally = {
     queued: 0,
     retry_queued: 0,
@@ -867,13 +1023,30 @@ async function handleCallbackQuery(env, cq) {
   };
 
   for (const normalized of urls) {
-    const outcome = await enqueueOneUrl(env, chatId, normalized, now, account);
+    const outcome = await enqueueOneUrl(env, chatId, normalized, now, account, batchId);
     tally[outcome]++;
   }
 
+  const toProcess = tally.queued + tally.retry_queued;
+  await env.DB.prepare(
+    "UPDATE join_batches SET to_process = ?, already_joined_before = ?, already_requested_before = ?, in_progress_skip = ?, status = ?, updated_at = ? WHERE id = ?"
+  ).bind(
+    toProcess,
+    tally.already_done,
+    tally.already_requested,
+    tally.in_progress,
+    // Nothing new was actually queued (every URL was a duplicate/invalid/
+    // already in flight) — there's nothing left to resolve later, so the
+    // batch is already done; no "in progress" or final-summary message
+    // needed beyond the intake summary below.
+    toProcess === 0 ? "done" : "in_progress",
+    Date.now(),
+    batchId
+  ).run();
+
   await answerCallbackQuery(env, cq.id, `✅ ${account} ရွေးပြီးပါပြီ`);
 
-  const summary = `Account: ${account}\n\n${buildIntakeSummary(tally, urls.length + (invalidCount || 0) + (unsupportedCount || 0))}`;
+  const summary = `Account: ${account}\n\n${buildIntakeSummary(tally, totalEntries)}`;
   if (messageId) {
     await editMessageText(env, chatId, messageId, summary);
   } else {
@@ -1019,7 +1192,7 @@ async function buildStatusMessage(env) {
 // joined before (skip — this is the "no wasted API call on a duplicate"
 // guard), or already mid-flight (queued/triggered right now — skip, it's
 // already moving through the pipeline).
-async function enqueueOneUrl(env, chatId, normalized, now, account) {
+async function enqueueOneUrl(env, chatId, normalized, now, account, batchId) {
   const existing = await env.DB.prepare(
     "SELECT last_status FROM processed_urls WHERE url_normalized = ? AND account = ?"
   ).bind(normalized, account).first();
@@ -1030,8 +1203,8 @@ async function enqueueOneUrl(env, chatId, normalized, now, account) {
         "INSERT INTO processed_urls (url_normalized, account, first_seen_at, last_status) VALUES (?, ?, ?, 'queued')"
       ).bind(normalized, account, now),
       env.DB.prepare(
-        "INSERT INTO join_queue (chat_id, url_normalized, account, status, created_at) VALUES (?, ?, ?, 'queued', ?)"
-      ).bind(String(chatId), normalized, account, now),
+        "INSERT INTO join_queue (chat_id, url_normalized, account, status, created_at, batch_id) VALUES (?, ?, ?, 'queued', ?, ?)"
+      ).bind(String(chatId), normalized, account, now, batchId),
     ]);
     return "queued";
   }
@@ -1059,8 +1232,8 @@ async function enqueueOneUrl(env, chatId, normalized, now, account) {
       "UPDATE processed_urls SET last_status = 'queued' WHERE url_normalized = ? AND account = ?"
     ).bind(normalized, account),
     env.DB.prepare(
-      "INSERT INTO join_queue (chat_id, url_normalized, account, status, created_at) VALUES (?, ?, ?, 'queued', ?)"
-    ).bind(String(chatId), normalized, account, now),
+      "INSERT INTO join_queue (chat_id, url_normalized, account, status, created_at, batch_id) VALUES (?, ?, ?, 'queued', ?, ?)"
+    ).bind(String(chatId), normalized, account, now, batchId),
   ]);
   return "retry_queued";
 }
@@ -1196,6 +1369,9 @@ async function syncBotCommands(env) {
   return true;
 }
 
+// Returns the sent message's Telegram message_id (or null on failure) so
+// callers that need to edit it later (e.g. notifyBatchStarted) can — every
+// existing call site ignores the return value, so this is additive.
 async function replyToUser(env, chatId, text) {
   const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -1204,7 +1380,10 @@ async function replyToUser(env, chatId, text) {
   });
   if (!res.ok) {
     console.error("sendMessage failed:", res.status, await res.text());
+    return null;
   }
+  const data = await res.json();
+  return data?.result?.message_id ?? null;
 }
 
 // Phase 7: sends the CH / JL picker as an inline keyboard. callback_data is

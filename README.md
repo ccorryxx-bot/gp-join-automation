@@ -21,10 +21,12 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 3 - dispatcher Worker (Cron + GitHub dispatch)
 - [x] Phase 4 - join.yml GitHub Action (Telethon join + FloodWait handling)
 - [x] Phase 5 - /report endpoint + user notification
-- [x] Phase 6a - bulk-URL intake + one-at-a-time pacing (code complete, **not yet live-tested** — see below)
-- [ ] Phase 6b - end-to-end test **(in progress — webhook leg verified live, see Live Verification Log)**
-- [ ] Phase 7 - multi-account (CH / JL) + admin gating **(code pushed 2026-09-22, not yet live-tested — needs JL_* GitHub secrets added manually, then a real webhook run)**
-- [ ] Phase 8 - production cutover
+- [x] Phase 6a - bulk-URL intake + one-at-a-time pacing
+- [x] Phase 6b - end-to-end test (join loop confirmed live after the telethon.sync + report-UA fix)
+- [x] Phase 7 - multi-account (CH / JL) + admin gating (live-tested)
+- [x] Phase 8 - leave muted/admin-restricted groups automation (repurposed from the original "production cutover" plan — see leave.yml)
+- [x] Phase 9 - leave-scan also flags low-member (<50) groups; request-to-join + read-only/paid-message group detection (9d)
+- [x] Phase 10 - batched join notifications (2026-09-28) — see below
 
 ## Bulk-URL intake (added 2026-09-22)
 
@@ -93,9 +95,48 @@ Anyone else's message is silently dropped — no reply at all.
   `already_member` / `failed`) broken out per account
 - `/help` (also `/start`) — short usage reminder
 
-**Not yet live-tested** — needs the three `JL_*` GitHub secrets added
-manually (see Secrets below), then a real message sent to the bot to
-confirm the CH/JL buttons render and route correctly end-to-end.
+## Batched join notifications (added 2026-09-28, Phase 10)
+
+Before this, every URL in a batch got its own Telegram message twice over —
+once when it started ("🔄 [CH] လုပ်ဆောင်နေပါပြီ...") and once when it
+resolved (✅ / ❌ / ℹ️). A 10-link batch meant ~20 separate messages. Now
+every join_queue row created by one account-picker tap shares a `batch_id`
+(`join_batches` table, `migrations/005_join_batches.sql`), and the batch as
+a whole gets exactly **two** messages regardless of size:
+
+1. **One "in progress" message**, sent the first time any row in the batch
+   actually dispatches to GitHub Actions (`notifyBatchStarted` — guarded by
+   `join_batches.progress_notified` so a 10-row batch only fires this once).
+2. **One final summary**, sent once every row in the batch has resolved
+   (`resolveBatchForRow`, called from `/report`, the stale-timeout sweep,
+   and a dispatch-failure both — every terminal outcome a row can reach):
+
+   ```
+   🏁 [CH] ပြီးသွားပါပြီ!
+
+   Total Url - 10
+   Already joined - 2
+   Join Success - 6
+   Join Failed - 1
+   Invalid - 1
+   ```
+
+   Optional extra lines (pending-approval / unsupported `t.me/c/...` links /
+   duplicate-in-flight skips) only appear when their count is non-zero, and
+   a failed batch also gets a short list of the actual failed links + reason
+   (capped at 10) appended below the counts — so nothing that used to be in
+   the per-URL ❌ messages is lost, it's just gathered into the one summary
+   instead of spread across N messages.
+
+   The final summary **edits the "in progress" message in place** rather
+   than sending a 3rd message (same `editMessageText` pattern already used
+   for the account-picker prompt) — falls back to a fresh message only if a
+   batch never got as far as dispatching (e.g. every row in it failed
+   GitHub's dispatch call itself).
+
+A row with no `batch_id` (only possible for a pre-Phase-10 row still
+in-flight at deploy time) transparently falls back to the old
+one-message-per-row behavior for just that row.
 
 ## Live Verification Log
 

@@ -26,10 +26,38 @@ CREATE TABLE IF NOT EXISTS join_queue (
   detail            TEXT,
   created_at        INTEGER NOT NULL,
   updated_at        INTEGER,
-  dispatch_attempts INTEGER NOT NULL DEFAULT 0  -- bounds GitHub-dispatch retries (see MAX_DISPATCH_ATTEMPTS)
+  dispatch_attempts INTEGER NOT NULL DEFAULT 0,  -- bounds GitHub-dispatch retries (see MAX_DISPATCH_ATTEMPTS)
+  batch_id          INTEGER  -- added 2026-09-28 (Phase 10, see migrations/005): groups rows from one account-picker tap for batched notifications
 );
 
 CREATE INDEX IF NOT EXISTS idx_join_queue_account_status ON join_queue(account, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_join_queue_batch_id ON join_queue(batch_id);
+
+-- added 2026-09-28 (Phase 10): batched join notifications -- see
+-- migrations/005_join_batches.sql for the full write-up.
+CREATE TABLE IF NOT EXISTS join_batches (
+  id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id                   TEXT NOT NULL,
+  account                   TEXT NOT NULL,
+  total_entries             INTEGER NOT NULL DEFAULT 0,
+  to_process                INTEGER NOT NULL DEFAULT 0,
+  already_joined_before     INTEGER NOT NULL DEFAULT 0,
+  already_requested_before  INTEGER NOT NULL DEFAULT 0,
+  in_progress_skip          INTEGER NOT NULL DEFAULT 0,
+  invalid_count             INTEGER NOT NULL DEFAULT 0,
+  unsupported_count         INTEGER NOT NULL DEFAULT 0,
+  resolved_count            INTEGER NOT NULL DEFAULT 0,
+  joined_count              INTEGER NOT NULL DEFAULT 0,
+  already_member_count      INTEGER NOT NULL DEFAULT 0,
+  pending_approval_count    INTEGER NOT NULL DEFAULT 0,
+  failed_count              INTEGER NOT NULL DEFAULT 0,
+  progress_notified         INTEGER NOT NULL DEFAULT 0,
+  progress_message_id       INTEGER,
+  status                    TEXT NOT NULL DEFAULT 'in_progress',
+  created_at                INTEGER NOT NULL,
+  updated_at                INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_join_batches_status ON join_batches(status);
 
 -- TEMP (added 2026-09-22): captures every request that reaches /report,
 -- pass or fail, while debugging stale_no_report_timeout. Never stores the
