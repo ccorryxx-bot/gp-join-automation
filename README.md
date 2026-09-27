@@ -28,6 +28,7 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 9 - leave-scan also flags low-member (<50) groups; request-to-join + read-only/paid-message group detection (9d)
 - [x] Phase 10 - batched join notifications (2026-09-28) — see below
 - [x] Phase 11 - `/account_status` command — per-account group-count snapshot (2026-09-28) — see below
+- [x] Phase 12 - "Extract muted group urls" button on the scan-result message (2026-09-28) — see below
 
 ## Bulk-URL intake (added 2026-09-22)
 
@@ -168,6 +169,41 @@ Stateless by design: unlike `/leavescan`, nothing is written to D1 for a
 status run (no `leave_scans` row) — there's nothing to confirm or act on
 later, so there's nothing to persist beyond a short-lived
 `status:running:{account}` KV guard against a double-tap.
+
+## "Extract muted group urls" button (added 2026-09-28, Phase 12)
+
+A `🔗 Extract muted group urls` button now appears on the scan-result
+message (above Yes/No) whenever a scan finds at least one `muted`
+candidate. Tapping it is a **plain D1 read, nothing else** — no GitHub
+Action, no Telethon session, no Telegram API call:
+
+- Every candidate's `url` (`https://t.me/{username}`) is captured **for
+  free during the scan itself** (`dialog.entity.username`, already on the
+  entity from `iter_dialogs()` — same "already have it, no extra call"
+  pattern as the `read_only`/`paid_messages` checks) and stored in
+  `leave_candidates.url` (`migrations/006_leave_candidate_url.sql`).
+- The button handler (`handleExtractUrlsCallback`) just selects
+  `title, url FROM leave_candidates WHERE scan_id = ? AND reason = 'muted'`
+  and formats it back to the admin — no re-scan, no second session spin-up.
+- Legacy groups and private/invite-only channels never have a username, so
+  their `url` is `NULL` — getting a real link for those would mean
+  `ExportChatInviteRequest`, which needs "invite users" rights a
+  muted/restricted account never has (it would just be a wasted, failing
+  call). Those are listed separately by title instead of silently dropped:
+
+  ```
+  🔗 [CH] Muted group urls — 4 ခုထဲက 2 ခု url ရပါတယ်:
+
+  1. https://t.me/groupA
+  2. https://t.me/groupB
+
+  ⚠️ Private/invite-only group 2 ခု — url မရနိုင်ပါ (username မရှိလို့, join ဖို့ invite link ကိုယ်တိုင်ရှာရပါလိမ့်မယ်):
+  1. Group C
+  2. Group D
+  ```
+
+Sent as a separate message (not an edit) so the original scan-result
+message's Yes/No buttons stay intact and tappable afterward.
 
 ## Live Verification Log
 

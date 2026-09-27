@@ -191,6 +191,13 @@ def scan_leave_candidates(client) -> tuple:
                                free -- same entity)
       4. "under_50_members"  -- total members below MIN_MEMBERS_THRESHOLD
                                (Phase 9a, usually free, occasionally 1 call)
+
+    Phase 12 (2026-09-28): every candidate also carries "url" -- the t.me
+    link for public groups (dialog.entity.username, free, no extra call),
+    or null for legacy/private/invite-only ones (getting a real link for
+    those needs ExportChatInviteRequest, which needs "invite users" rights
+    a muted/restricted account doesn't have -- so it's just left null
+    instead of attempting a call that would fail anyway).
     """
     me = client.get_me()
     total = 0
@@ -204,6 +211,19 @@ def scan_leave_candidates(client) -> tuple:
         if not (dialog.is_group or dialog.is_channel):
             continue
         total += 1
+
+        # Free -- already on dialog.entity from iter_dialogs(), same as the
+        # read_only/paid_messages checks below. Only public groups/channels
+        # (Channel entities with a username) have a stable, always-valid
+        # t.me URL; legacy Chats and private/invite-only channels don't
+        # expose one here. Getting a URL for those would mean
+        # ExportChatInviteRequest, which needs "invite users" rights -- a
+        # muted/restricted account never has that, so it would just be a
+        # wasted, failing API call. Candidates without a username simply
+        # carry url=None; the Worker reports those as "url not available"
+        # rather than the bot silently pretending every group has one.
+        username = getattr(dialog.entity, "username", None) if dialog.is_channel else None
+        url = f"https://t.me/{username}" if username else None
 
         muted = False
         # Basic (legacy) groups don't expose per-user banned_rights the same
@@ -240,6 +260,7 @@ def scan_leave_candidates(client) -> tuple:
                 "peer_type": "channel",
                 "title": dialog.title or "",
                 "reason": "muted",
+                "url": url,
             })
         else:
             # Phase 9b/9c (2026-09-26): messaging-restriction checks. Both
@@ -277,6 +298,7 @@ def scan_leave_candidates(client) -> tuple:
                     "peer_type": "channel" if dialog.is_channel else "chat",
                     "title": dialog.title or "",
                     "reason": reason,
+                    "url": url,
                 }
                 if reason == "under_50_members":
                     candidate["member_count"] = member_count

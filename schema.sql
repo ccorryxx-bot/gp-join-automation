@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS leave_candidates (
   peer_type  TEXT NOT NULL,
   title      TEXT,
   reason     TEXT NOT NULL DEFAULT 'muted',  -- added 2026-09-26 (Phase 9, see migrations/004): 'muted' / 'read_only' / 'paid_messages' / 'under_50_members'
+  url        TEXT,  -- added 2026-09-28 (Phase 12, see migrations/006): t.me URL for public groups, NULL for legacy/private/invite-only
   status     TEXT NOT NULL DEFAULT 'pending',
   detail     TEXT,
   updated_at INTEGER

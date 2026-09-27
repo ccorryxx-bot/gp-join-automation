@@ -581,9 +581,9 @@ async function handleLeaveReport(request, env) {
         candidates.map((c) =>
           env.DB
             .prepare(
-              "INSERT INTO leave_candidates (scan_id, peer_id, peer_type, title, reason, status, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
+              "INSERT INTO leave_candidates (scan_id, peer_id, peer_type, title, reason, url, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)"
             )
-            .bind(scanId, String(c.peer_id), c.peer_type || "channel", c.title || "", c.reason || "muted", now)
+            .bind(scanId, String(c.peer_id), c.peer_type || "channel", c.title || "", c.reason || "muted", c.url || null, now)
         )
       );
     }
@@ -645,11 +645,19 @@ async function handleLeaveReport(request, env) {
       .map((s) => `\n\n${s.emoji} ${s.label} — ${byReason[s.key].length} ခု တွေ့တယ်။\n${formatSection(byReason[s.key])}`)
       .join("");
 
+    // Phase 12 (2026-09-28): only shown when there's something to extract —
+    // a scan with zero muted candidates (e.g. only read_only/paid_messages/
+    // under_50_members hits) has nothing for the button to do.
+    const extractRow = byReason.muted.length > 0
+      ? [[{ text: "🔗 Extract muted group urls", callback_data: `extracturls:${account}:${scanId}` }]]
+      : [];
+
     await notifyAdmin(
       env,
       `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက Leave candidate ${candidates.length} ခု တွေ့ပါတယ်။${sections}\n\nYes ဆို အမျိုးအစားအားလုံး တစ်ခါထဲ Leave မယ် — Confirm ပါ 👇`,
       {
         inline_keyboard: [
+          ...extractRow,
           [
             { text: "✅ Yes, Leave", callback_data: `leaveconfirm:${account}:${scanId}:yes` },
             { text: "❌ No, Cancel", callback_data: `leaveconfirm:${account}:${scanId}:no` },
@@ -1004,6 +1012,11 @@ async function handleCallbackQuery(env, cq) {
     return;
   }
 
+  if (data.startsWith("extracturls:")) {
+    await handleExtractUrlsCallback(env, cq, data, chatId);
+    return;
+  }
+
   if (data.startsWith("leavescan:")) {
     const account = data.slice("leavescan:".length);
     if (!ACCOUNTS.includes(account)) {
@@ -1136,6 +1149,51 @@ async function handleCallbackQuery(env, cq) {
   } else {
     await replyToUser(env, chatId, summary);
   }
+}
+
+// Phase 12 (2026-09-28): "🔗 Extract muted group urls" button on the
+// scan-result message. Read-only — no GitHub Action, no Telethon session,
+// no API call to Telegram at all. Every candidate's url (or lack of one)
+// was already captured for free during the scan itself (see
+// scan_leave_candidates()'s comment in scripts/leave_groups.py) and stored
+// in leave_candidates.url, so this is a plain D1 read. Sent as a separate
+// message rather than editing the scan-result one, so the Yes/No confirm
+// buttons on that message stay intact and tappable afterward.
+async function handleExtractUrlsCallback(env, cq, data, chatId) {
+  const [, account, scanIdRaw] = data.split(":");
+  const scanId = Number(scanIdRaw);
+  if (!ACCOUNTS.includes(account) || !Number.isInteger(scanId)) {
+    await answerCallbackQuery(env, cq.id, "⚠️ Internal error");
+    return;
+  }
+
+  const { results } = await env.DB.prepare(
+    "SELECT title, url FROM leave_candidates WHERE scan_id = ? AND reason = 'muted' ORDER BY id"
+  ).bind(scanId).all();
+
+  await answerCallbackQuery(env, cq.id);
+
+  if (results.length === 0) {
+    await replyToUser(env, chatId, `🔗 [${account}] Muted candidate မရှိတော့ပါဘူး (scan ဟောင်းသွားပြီလား?)`);
+    return;
+  }
+
+  const withUrl = results.filter((r) => r.url);
+  const withoutUrl = results.filter((r) => !r.url);
+
+  const lines = [`🔗 [${account}] Muted group urls — ${results.length} ခုထဲက ${withUrl.length} ခု url ရပါတယ်:`];
+  if (withUrl.length > 0) {
+    lines.push("", ...withUrl.map((r, i) => `${i + 1}. ${r.url}`));
+  }
+  if (withoutUrl.length > 0) {
+    lines.push(
+      "",
+      `⚠️ Private/invite-only group ${withoutUrl.length} ခု — url မရနိုင်ပါ (username မရှိလို့, join ဖို့ invite link ကိုယ်တိုင်ရှာရပါလိမ့်မယ်):`,
+      ...withoutUrl.map((r, i) => `${i + 1}. ${r.title || "(no title)"}`)
+    );
+  }
+
+  await replyToUser(env, chatId, lines.join("\n"));
 }
 
 // Phase 8: admin tapped Yes/No on the leave-confirm prompt sent from
