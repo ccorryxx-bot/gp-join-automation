@@ -1018,23 +1018,35 @@ async function handleCallbackQuery(env, cq) {
   }
 
   if (data.startsWith("leavescan:")) {
-    const account = data.slice("leavescan:".length);
-    if (!ACCOUNTS.includes(account)) {
+    // "BOTH" (added 2026-09-28) fires an independent scan per account —
+    // each has its own leave_scans row, its own running guard, its own
+    // scan-result message and its own Yes/No confirm. Different accounts use
+    // different leave.yml concurrency groups, so the two runs go in parallel.
+    const choice = data.slice("leavescan:".length);
+    const accountsToRun = choice === "BOTH" ? ACCOUNTS : ACCOUNTS.includes(choice) ? [choice] : null;
+    if (!accountsToRun) {
       await answerCallbackQuery(env, cq.id, "⚠️ မသိတဲ့ account");
       return;
     }
-    const result = await triggerLeaveScan(env, account);
+
     const RESULT_TEXT = {
-      running: `⏳ [${account}] Scan/Leave တစ်ခု အရင်ကတည်းက run နေပါတယ် — အဲဒါ ပြီးမှ ထပ်ခေါ်ပါ`,
-      awaiting_confirm: `⌛ [${account}] ရှေ့က scan ရလဒ်ကို Yes/No confirm မလုပ်ရသေးပါ — အဲဒီ message ပေါ်ကို အရင် action ယူပါ`,
-      started: `✅ [${account}] Scan စပါပြီ — ပြီးရင် muted group list ကို ဒီမှာ ပြောပေးပါမယ်`,
-      dispatch_failed: `⚠️ [${account}] Scan dispatch မအောင်မြင်ပါ — /leavescan ပြန်ခေါ်ကြည့်ပါ`,
+      running: (a) => `⏳ [${a}] Scan/Leave တစ်ခု အရင်ကတည်းက run နေပါတယ် — အဲဒါ ပြီးမှ ထပ်ခေါ်ပါ`,
+      awaiting_confirm: (a) => `⌛ [${a}] ရှေ့က scan ရလဒ်ကို Yes/No confirm မလုပ်ရသေးပါ — အဲဒီ message ပေါ်ကို အရင် action ယူပါ`,
+      started: (a) => `✅ [${a}] Scan စပါပြီ — ပြီးရင် muted group list ကို ဒီမှာ ပြောပေးပါမယ်`,
+      dispatch_failed: (a) => `⚠️ [${a}] Scan dispatch မအောင်မြင်ပါ — /leavescan ပြန်ခေါ်ကြည့်ပါ`,
     };
+    const lines = [];
+    for (const acc of accountsToRun) {
+      const result = await triggerLeaveScan(env, acc);
+      lines.push(RESULT_TEXT[result] ? RESULT_TEXT[result](acc) : `⚠️ [${acc}] Internal error`);
+    }
+
     await answerCallbackQuery(env, cq.id);
+    const summary = lines.join("\n");
     if (messageId) {
-      await editMessageText(env, chatId, messageId, RESULT_TEXT[result] || "⚠️ Internal error");
+      await editMessageText(env, chatId, messageId, summary);
     } else {
-      await replyToUser(env, chatId, RESULT_TEXT[result] || "⚠️ Internal error");
+      await replyToUser(env, chatId, summary);
     }
     return;
   }
@@ -1569,7 +1581,12 @@ async function sendLeaveScanPrompt(env, chatId) {
       chat_id: chatId,
       text: "🔍 Muted group scan — ဘယ် Account ကို scan မလဲ ရွေးပါ 👇",
       reply_markup: {
-        inline_keyboard: [ACCOUNTS.map((a) => ({ text: `Scan ${a}`, callback_data: `leavescan:${a}` }))],
+        inline_keyboard: [
+          [
+            ...ACCOUNTS.map((a) => ({ text: `Scan ${a}`, callback_data: `leavescan:${a}` })),
+            { text: "Scan Both", callback_data: "leavescan:BOTH" },
+          ],
+        ],
       },
     }),
   });

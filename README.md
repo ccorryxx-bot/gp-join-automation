@@ -29,6 +29,7 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 10 - batched join notifications (2026-09-28) — see below
 - [x] Phase 11 - `/account_status` command — per-account group-count snapshot (2026-09-28) — see below
 - [x] Phase 12 - "Extract muted group urls" button on the scan-result message (2026-09-28) — see below
+- [x] Phase 13 - `/leavescan` "Scan Both" option (2026-09-28) — see below
 
 ## Bulk-URL intake (added 2026-09-22)
 
@@ -204,6 +205,17 @@ Action, no Telethon session, no Telegram API call:
 
 Sent as a separate message (not an edit) so the original scan-result
 message's Yes/No buttons stay intact and tappable afterward.
+
+## `/leavescan` "Scan Both" (added 2026-09-28, Phase 13)
+
+`/leavescan` now offers **Scan CH / Scan JL / Scan Both**, same as
+`/account_status`. "Both" just calls `triggerLeaveScan()` once per account —
+each account gets its own `leave_scans` row, its own running/awaiting-confirm
+guard, its own scan-result message and its own Yes/No confirm (nothing is
+merged). CH and JL use different `leave.yml` concurrency groups, so the two
+scans run in parallel. If one account is busy (already scanning, or a
+previous scan is still awaiting Yes/No), only that account reports "busy" in
+the reply; the other still starts.
 
 ## Live Verification Log
 
