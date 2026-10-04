@@ -142,7 +142,37 @@ export default {
   },
 };
 
-const GITHUB_REPO = "ccorryxx-bot/gp-join-automation";
+// Phase 4 cutover prep (vps-gpjoin-workflow): which GitHub repo's join.yml / leave.yml gets dispatched is
+// decided PER ACCOUNT, so CH can move to the VPS-backed repo while JL stays on this one (and back).
+//
+// GITHUB_REPO_MAP is a Worker var holding JSON, e.g. {"CH":"ccorryxx-bot/vps-gpjoin-workflow"}.
+//   - unset / "" / "{}"        -> every account uses DEFAULT_GITHUB_REPO (== behaviour before this change)
+//   - account listed           -> that account uses the mapped repo
+//   - invalid JSON / bad value -> THROWS. The dispatch then fails visibly (same retry + user notice path as a
+//     GitHub outage). It must NEVER silently fall back to the other repo: that could put two live users on one
+//     Telegram session (roadmap principle 4 / D7).
+const DEFAULT_GITHUB_REPO = "ccorryxx-bot/gp-join-automation";
+const GITHUB_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+function githubRepoFor(env, account) {
+  const raw = (env.GITHUB_REPO_MAP || "").trim();
+  if (!raw) return DEFAULT_GITHUB_REPO;
+  let map;
+  try {
+    map = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`GITHUB_REPO_MAP is not valid JSON: ${err.message}`);
+  }
+  if (map === null || typeof map !== "object" || Array.isArray(map)) {
+    throw new Error("GITHUB_REPO_MAP must be a JSON object like {\"CH\":\"owner/repo\"}");
+  }
+  if (!Object.prototype.hasOwnProperty.call(map, account)) return DEFAULT_GITHUB_REPO;
+  const repo = map[account];
+  if (typeof repo !== "string" || !GITHUB_REPO_PATTERN.test(repo)) {
+    throw new Error(`GITHUB_REPO_MAP[${account}] is not an "owner/repo" string`);
+  }
+  return repo;
+}
 
 // A dispatch is retried on the next tick if it fails (GitHub API down, bad
 // token, network blip). After this many attempts we stop retrying silently
@@ -219,8 +249,9 @@ async function dispatchNextQueuedJoinForAccount(env, account) {
   let dispatchRes = null;
   let dispatchErrText = "";
   try {
+    const repo = githubRepoFor(env, account);
     dispatchRes = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/join.yml/dispatches`,
+      `https://api.github.com/repos/${repo}/actions/workflows/join.yml/dispatches`,
       {
         method: "POST",
         headers: {
@@ -353,8 +384,9 @@ async function triggerAccountStatus(env, account) {
 // live/tested in production; not touching it for a DRY-only change.
 async function dispatchLeaveWorkflow(env, account, mode, scanId) {
   try {
+    const repo = githubRepoFor(env, account);
     const res = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/leave.yml/dispatches`,
+      `https://api.github.com/repos/${repo}/actions/workflows/leave.yml/dispatches`,
       {
         method: "POST",
         headers: {

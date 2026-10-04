@@ -24,6 +24,12 @@ crons = ["*/1 * * * *"]  # every 1 min; dispatcher pops exactly 1 queued row/tic
 [vars]
 ADMIN_TG_ID = "7699538187"
 
+# Phase 4 cutover switch (see githubRepoFor in src/worker.js). "{}" = every account dispatches to
+# ccorryxx-bot/gp-join-automation (current behaviour). To move one account to the VPS-backed repo:
+#   GITHUB_REPO_MAP = '{"CH":"ccorryxx-bot/vps-gpjoin-workflow"}'   then deploy.
+# Rollback = set it back to "{}" and deploy. GH_PAT must be able to dispatch workflows on BOTH repos.
+GITHUB_REPO_MAP = "{}"
+
 # Secrets (set via `wrangler secret put`, NOT here):
 #   TG_BOT_TOKEN        - Telegram Bot API token
 #   TG_WEBHOOK_SECRET   - secret_token for webhook spoof protection
