@@ -24,11 +24,11 @@ Phase 8 (2026-09-23): "leave muted groups" automation, invoked by
                /account_status bot command. Same dialog walk as MODE=scan's
                muted/read_only/paid_messages checks, but every group lands
                in exactly one bucket (total / active / restricted /
-               paid_messages / read_only) instead of building a leave
+               paid_messages / read_only / broadcast / unchecked) instead of building a leave
                candidate list, and the member-count fallback is skipped
                entirely -- it's the one check in MODE=scan that can cost an
                extra get_participants call per group, and /account_status
-               has no use for that number. Reports the five counts back in
+               has no use for that number. Reports the counts back in
                a single POST to /leave-report (mode=status). SCAN_ID is
                unused here (no leave_scans row exists for a status run --
                nothing to confirm or leave later) but still required/sent
@@ -57,11 +57,20 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 from tg_accounts import make_client
 from telethon.errors import FloodWaitError, PeerFloodError, RPCError
 from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.types import ChannelParticipantBanned
+from telethon.tl.types import (
+    Channel,
+    ChannelParticipantAdmin,
+    ChannelParticipantBanned,
+    ChannelParticipantCreator,
+    ChannelParticipantLeft,
+    Chat,
+    ChatForbidden,
+)
 
 ACCOUNT = os.environ.get("ACCOUNT", "CH")
 MODE = os.environ["MODE"]  # "scan" | "leave"
@@ -139,253 +148,292 @@ def fetch_candidates() -> list:
         return json.loads(resp.read()).get("candidates", [])
 
 
-def get_member_count(client, dialog):
-    """Cheap total-member count for a dialog. Legacy (non-channel) groups
-    already carry this on the entity for free (Chat.participants_count is
-    always populated, no extra call). Channels/supergroups often have it
-    too, but when the dialog listing didn't include it, fall back to
-    get_participants(limit=1) -- Telegram still returns the true total
-    count in that response even though only 1 row comes back, so this
-    doesn't mean downloading the whole member list."""
-    count = getattr(dialog.entity, "participants_count", None)
-    if count is not None:
-        return count
+# ---------------------------------------------------------------------------
+# Classification -- ONE implementation shared by status, scan and the
+# leave-time re-check, so the three can never drift apart (before 2026-10-15
+# status and scan each carried their own copy of this logic).
+#
+# Every rule below is tied to a source, not a guess:
+#   * Administrators/creators are NOT affected by a group's default
+#     restrictions; plain members AND restricted users are
+#     (tdlib DialogParticipantStatus::apply_restrictions).
+#   * Telethon's iter_dialogs() returns migrated/deactivated legacy chats
+#     unless told not to (ignore_migrated defaults to False) and
+#     delete_dialog() itself special-cases deactivated chats.
+#   * Telethon's TL date reader returns 1970-01-01 (not None) for
+#     until_date=0, i.e. "forever".
+#   * get_participants(limit=0) is GetFullChannel -- Telethon's own comment:
+#     "May not have access to the channel, but getFull can get the .total".
+#     limit>=1 is channels.getParticipants, which needs rights a normal
+#     member of a broadcast channel doesn't have.
+# ---------------------------------------------------------------------------
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def is_live_group(entity):
+    """(True, "") if this dialog is a group/channel the account is actually IN
+    right now. Otherwise (False, why) -- such dialogs are neither counted nor
+    ever offered for leaving."""
+    if isinstance(entity, ChatForbidden):
+        return False, "forbidden"
+    if isinstance(entity, Chat):
+        if getattr(entity, "deactivated", False) or getattr(entity, "migrated_to", None) is not None:
+            return False, "migrated_or_deactivated"
+        if getattr(entity, "left", False):
+            return False, "left"
+    if isinstance(entity, Channel) and getattr(entity, "left", False):
+        return False, "left"
+    return True, ""
+
+
+def is_admin(entity):
+    return bool(getattr(entity, "creator", False) or getattr(entity, "admin_rights", None))
+
+
+def mute_state(rights, now):
+    """(muted_now, until). Muted = can't send text but can still view.
+    until=None means permanent. A restriction whose until_date has passed is
+    expired (tdlib treats it the same way) and is NOT muted."""
+    if not (rights and rights.send_messages and not rights.view_messages):
+        return False, None
+    until = getattr(rights, "until_date", None)
+    if until is None or until.timestamp() < 30:  # epoch / <30s == "forever"
+        return True, None
+    if until <= now:
+        return False, None
+    return True, until
+
+
+def _with_floodwait_retry(fn, tag):
+    """Run fn(); on a short FloodWait sleep and retry ONCE (the old code just
+    skipped the group). Anything else propagates to the caller."""
     try:
-        return client.get_participants(dialog.entity, limit=1).total
+        return fn()
     except FloodWaitError as e:
         if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
-            print(f"[scan] FloodWait {e.seconds}s too long, skipping member-count for {dialog.id}")
-            return None
-        print(f"[scan] FloodWait {e.seconds}s -- sleeping (member count check)")
+            print(f"[{tag}] FloodWait {e.seconds}s too long -- giving up on this call")
+            raise
+        print(f"[{tag}] FloodWait {e.seconds}s -- sleeping, then retrying once")
         time.sleep(e.seconds + 1)
-        try:
-            return client.get_participants(dialog.entity, limit=1).total
-        except Exception:
-            return None
+        return fn()
+
+
+def get_member_count(client, entity):
+    """Total member count as Telegram reports it (includes bots; Telegram
+    gives no cheap human-only number). Legacy chats always carry it; channels
+    often do, otherwise GetFullChannel (limit=0) -- works without admin rights."""
+    count = getattr(entity, "participants_count", None)
+    if count is not None:
+        return count
+    if not isinstance(entity, Channel):
+        return None
+    try:
+        return _with_floodwait_retry(lambda: client.get_participants(entity, limit=0).total, "count")
     except RPCError as e:
-        print(f"[scan] can't read member count for {dialog.id}: {type(e).__name__}")
+        print(f"[count] can't read member count for {entity.id}: {type(e).__name__}")
         return None
 
 
+def evaluate(client, entity, me_id, now):
+    """Classify one live group/channel for this account.
+    Returns {"bucket", "admin", ...} with bucket one of:
+      muted | read_only | paid_messages | broadcast | active | unchecked
+    "unchecked" = Telegram wouldn't tell us (error in "error"); it is counted
+    as such instead of silently vanishing from the totals."""
+    info = {"bucket": "active", "admin": False}
+    if is_admin(entity):
+        # Admins/creators can post regardless of default restrictions and are
+        # never restricted per-user, so no GetParticipant call is needed.
+        info["admin"] = True
+        return info
+
+    is_channel = isinstance(entity, Channel)
+    if is_channel:
+        try:
+            participant = _with_floodwait_retry(
+                lambda: client(GetParticipantRequest(entity, me_id)).participant, "participant")
+        except RPCError as e:
+            return {"bucket": "unchecked", "admin": False, "error": type(e).__name__}
+        if isinstance(participant, (ChannelParticipantAdmin, ChannelParticipantCreator)):
+            # Telegram itself says admin/creator -- trust that over a possibly
+            # stale/min entity that lacked the admin_rights flag.
+            info["admin"] = True
+            return info
+        if isinstance(participant, ChannelParticipantLeft):
+            return {"bucket": "unchecked", "admin": False, "error": "not_a_participant"}
+        if isinstance(participant, ChannelParticipantBanned):
+            rights = participant.banned_rights
+            if rights and rights.view_messages:
+                # Fully banned/kicked -- not really "in" the group any more.
+                return {"bucket": "unchecked", "admin": False, "error": "banned"}
+            muted, until = mute_state(rights, now)
+            if muted:
+                info.update(bucket="muted", muted_until=until.isoformat() if until else None)
+                return info
+
+    default_rights = getattr(entity, "default_banned_rights", None)
+    stars = getattr(entity, "send_paid_messages_stars", None) if is_channel else None
+    if default_rights and default_rights.send_messages:
+        info["bucket"] = "read_only"      # group-wide: nobody but admins can send
+    elif stars:
+        info.update(bucket="paid_messages", stars_price=stars)
+    elif is_channel and (getattr(entity, "broadcast", False) or getattr(entity, "gigagroup", False)):
+        info["bucket"] = "broadcast"      # only admins post; members just read
+    return info
+
+
+def leave_reason(client, entity, info):
+    """Leave reason for an evaluated group, or None. Admin/creator groups are
+    NEVER leave candidates, and an unreadable group ("unchecked") can't be
+    judged so it isn't one either."""
+    if info["admin"]:
+        return None, {}
+    bucket = info["bucket"]
+    if bucket == "muted":
+        return "muted", ({"muted_until": info["muted_until"]} if info.get("muted_until") else {})
+    if bucket == "read_only":
+        return "read_only", {}
+    if bucket == "paid_messages":
+        return "paid_messages", {"stars_price": info["stars_price"]}
+    if bucket in ("active", "broadcast"):
+        count = get_member_count(client, entity)
+        if count is not None and count < MIN_MEMBERS_THRESHOLD:
+            return "under_50_members", {"member_count": count}
+    return None, {}
+
+
+def _public_url(entity):
+    username = getattr(entity, "username", None) if isinstance(entity, Channel) else None
+    return f"https://t.me/{username}" if username else None
+
+
 def scan_leave_candidates(client) -> tuple:
-    """Returns (total_groups, candidates). total_groups counts only actual
-    group/supergroup/channel dialogs -- this is Telegram's own "groups and
-    channels" count (the one the 500/1000 per-account limit applies to).
-    iter_dialogs() returns EVERY chat in the account's chat list, including
-    1:1 private chats, bots, and Saved Messages, so counting every dialog
-    (the old bug) always overshoots that limit by a lot -- a scan reporting
-    more "groups" than Telegram even allows per account is the tell.
-
-    Each candidate now carries a "reason", checked in this priority order
-    (a group is reported under at most ONE reason -- once one matches, the
-    rest are skipped, so a muted+small group only shows up as "muted"):
-      1. "muted"            -- admin-restricted for this account specifically
-                               (original Phase 8 check, needs an API call)
-      2. "read_only"         -- group-wide default_banned_rights.send_messages
-                               (Phase 9b, free -- already on dialog.entity)
-      3. "paid_messages"     -- send_paid_messages_stars set (Phase 9c, also
-                               free -- same entity)
-      4. "under_50_members"  -- total members below MIN_MEMBERS_THRESHOLD
-                               (Phase 9a, usually free, occasionally 1 call)
-
-    Phase 12 (2026-09-28): every candidate also carries "url" -- the t.me
-    link for public groups (dialog.entity.username, free, no extra call),
-    or null for legacy/private/invite-only ones (getting a real link for
-    those needs ExportChatInviteRequest, which needs "invite users" rights
-    a muted/restricted account doesn't have -- so it's just left null
-    instead of attempting a call that would fail anyway).
-    """
+    """Returns (total_groups, candidates). total_groups counts only groups and
+    channels the account is actually in (no private chats/bots/Saved
+    Messages, no migrated/deactivated legacy chats, no groups it was removed
+    from). A group is reported under at most ONE reason, priority:
+      muted > read_only > paid_messages > under_50_members
+    Admin/creator groups are never candidates. Candidates carry "url" (public
+    groups only) and, per reason, member_count / stars_price / muted_until
+    (set only for a temporary mute)."""
     me = client.get_me()
+    now = _now()
     total = 0
+    unchecked = 0
+    skipped = {}
     candidates = []
 
     for dialog in client.iter_dialogs():
-        # dialog.is_group covers basic (legacy) groups + supergroups;
-        # dialog.is_channel covers supergroups (megagroup=True) + broadcast
-        # channels. Together they're exactly "groups and channels" --
-        # private chats/bots (is_user) and Saved Messages are excluded.
         if not (dialog.is_group or dialog.is_channel):
+            continue
+        entity = dialog.entity
+        live, why = is_live_group(entity)
+        if not live:
+            skipped[why] = skipped.get(why, 0) + 1
             continue
         total += 1
 
-        # Free -- already on dialog.entity from iter_dialogs(), same as the
-        # read_only/paid_messages checks below. Only public groups/channels
-        # (Channel entities with a username) have a stable, always-valid
-        # t.me URL; legacy Chats and private/invite-only channels don't
-        # expose one here. Getting a URL for those would mean
-        # ExportChatInviteRequest, which needs "invite users" rights -- a
-        # muted/restricted account never has that, so it would just be a
-        # wasted, failing API call. Candidates without a username simply
-        # carry url=None; the Worker reports those as "url not available"
-        # rather than the bot silently pretending every group has one.
-        username = getattr(dialog.entity, "username", None) if dialog.is_channel else None
-        url = f"https://t.me/{username}" if username else None
-
-        muted = False
-        # Basic (legacy) groups don't expose per-user banned_rights the same
-        # way channels/supergroups do -- dialog.is_channel is Telethon's
-        # flag for "this is a Channel-type entity" and covers supergroups
-        # too (megagroup=True), which is exactly what admin-restriction
-        # applies to.
-        if dialog.is_channel:
-            try:
-                participant = client(GetParticipantRequest(dialog.entity, me.id)).participant
-            except FloodWaitError as e:
-                if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
-                    print(f"[scan] FloodWait {e.seconds}s too long, skipping {dialog.id}")
-                    continue
-                print(f"[scan] FloodWait {e.seconds}s -- sleeping")
-                time.sleep(e.seconds + 1)
-                continue
-            except RPCError as e:
-                print(f"[scan] can't read participant status for {dialog.id}: {type(e).__name__}")
-                continue
-            else:
-                if isinstance(participant, ChannelParticipantBanned):
-                    rights = participant.banned_rights
-                    # send_messages=True + view_messages=False is Telegram's
-                    # shape for "restricted/read-only" (muted).
-                    # view_messages=True means fully banned/kicked -- a
-                    # different case, not handled here, since the account
-                    # isn't meaningfully "in" that group anymore.
-                    muted = bool(rights and rights.send_messages and not rights.view_messages)
-
-        if muted:
-            candidates.append({
-                "peer_id": str(dialog.id),
-                "peer_type": "channel",
-                "title": dialog.title or "",
-                "reason": "muted",
-                "url": url,
-            })
+        info = evaluate(client, entity, me.id, now)
+        if info["bucket"] == "unchecked":
+            unchecked += 1
+            print(f"[scan] couldn't check {dialog.id}: {info.get('error')}")
         else:
-            # Phase 9b/9c (2026-09-26): messaging-restriction checks. Both
-            # fields are already present on dialog.entity from iter_dialogs()
-            # -- no extra API call, unlike the member-count fallback below --
-            # so they're checked first. Neither is knowable before joining
-            # (Telegram's pre-join invite preview, messages.checkChatInvite,
-            # doesn't expose default_banned_rights or send_paid_messages_stars
-            # at all), which is exactly why this lives in the leave-scan
-            # rather than the join step.
-            banned_rights = getattr(dialog.entity, "default_banned_rights", None)
-            stars_price = getattr(dialog.entity, "send_paid_messages_stars", None) if dialog.is_channel else None
-
-            reason = None
-            member_count = None
-            if banned_rights and banned_rights.send_messages:
-                # Admin turned off "Send Messages" for everyone (read-only
-                # group) -- not a per-user ban like the muted check above,
-                # a group-wide default.
-                reason = "read_only"
-            elif stars_price:
-                # Group requires paying stars_price Telegram Stars per
-                # message (Telegram's "Paid Messages in Groups" feature).
-                # Distinct from read_only -- sending IS possible, just not
-                # free.
-                reason = "paid_messages"
-            else:
-                member_count = get_member_count(client, dialog)
-                if member_count is not None and member_count < MIN_MEMBERS_THRESHOLD:
-                    reason = "under_50_members"
-
+            reason, extra = leave_reason(client, entity, info)
             if reason:
-                candidate = {
+                candidates.append({
                     "peer_id": str(dialog.id),
                     "peer_type": "channel" if dialog.is_channel else "chat",
                     "title": dialog.title or "",
                     "reason": reason,
-                    "url": url,
-                }
-                if reason == "under_50_members":
-                    candidate["member_count"] = member_count
-                elif reason == "paid_messages":
-                    candidate["stars_price"] = stars_price
-                candidates.append(candidate)
-
+                    "url": _public_url(entity),
+                    **extra,
+                })
         time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
 
+    print(f"[scan] total={total} candidates={len(candidates)} unchecked={unchecked} skipped_not_live={skipped}")
     return total, candidates
 
 
 def scan_account_status(client) -> dict:
-    """Phase 11 (2026-09-28): read-only group-count snapshot for the
-    /account_status bot command. Same detection order as
-    scan_leave_candidates (muted > read_only > paid_messages), but every
-    group lands in exactly one bucket and there's no under_50_members
-    check -- that's the only path in scan_leave_candidates that can cost an
-    extra API call (get_participants(limit=1) fallback), and this command
-    has no use for a member count, so status mode never makes that call.
-    The GetParticipantRequest for the muted check is still one call per
-    channel/supergroup dialog -- unavoidable, it's the only way Telegram
-    exposes per-account admin restriction.
-    """
+    """Read-only group-count snapshot for /account_status. Every live group
+    lands in exactly ONE bucket (same classifier as the scan), so
+    total == active + restricted + paid_messages + read_only + broadcast +
+    unchecked always holds (checked below and logged if it ever doesn't).
+      active        - the account can send normally (includes groups it admins)
+      restricted    - admin-muted for THIS account
+      read_only     - sending off for everyone (group default)
+      paid_messages - Stars per message
+      broadcast     - channel/broadcast group: members can't post
+      unchecked     - Telegram refused to tell us (see Actions log)"""
     me = client.get_me()
-    total = 0
-    active = 0
-    restricted = 0
-    paid_messages = 0
-    read_only = 0
+    now = _now()
+    counts = {"total": 0, "active": 0, "restricted": 0, "paid_messages": 0,
+              "read_only": 0, "broadcast": 0, "unchecked": 0}
+    skipped = {}
+    archived = 0
 
     for dialog in client.iter_dialogs():
         if not (dialog.is_group or dialog.is_channel):
             continue
-        total += 1
+        entity = dialog.entity
+        live, why = is_live_group(entity)
+        if not live:
+            skipped[why] = skipped.get(why, 0) + 1
+            continue
+        counts["total"] += 1
+        archived += 1 if getattr(dialog, "archived", False) else 0
 
-        muted = False
-        if dialog.is_channel:
-            try:
-                participant = client(GetParticipantRequest(dialog.entity, me.id)).participant
-            except FloodWaitError as e:
-                if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
-                    print(f"[status] FloodWait {e.seconds}s too long, skipping {dialog.id}")
-                    continue
-                print(f"[status] FloodWait {e.seconds}s -- sleeping")
-                time.sleep(e.seconds + 1)
-                continue
-            except RPCError as e:
-                print(f"[status] can't read participant status for {dialog.id}: {type(e).__name__}")
-                continue
-            else:
-                if isinstance(participant, ChannelParticipantBanned):
-                    rights = participant.banned_rights
-                    muted = bool(rights and rights.send_messages and not rights.view_messages)
-
-        if muted:
-            restricted += 1
-        else:
-            # Both fields are already on dialog.entity from iter_dialogs()
-            # -- free, same as scan_leave_candidates's read_only/paid_messages
-            # checks -- no extra call for either.
-            banned_rights = getattr(dialog.entity, "default_banned_rights", None)
-            stars_price = getattr(dialog.entity, "send_paid_messages_stars", None) if dialog.is_channel else None
-
-            if banned_rights and banned_rights.send_messages:
-                read_only += 1
-            elif stars_price:
-                paid_messages += 1
-            else:
-                active += 1
-
+        info = evaluate(client, entity, me.id, now)
+        if info["bucket"] == "unchecked":
+            print(f"[status] couldn't check {dialog.id}: {info.get('error')}")
+        counts["restricted" if info["bucket"] == "muted" else info["bucket"]] += 1
         time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
 
-    return {
-        "total": total,
-        "active": active,
-        "restricted": restricted,
-        "paid_messages": paid_messages,
-        "read_only": read_only,
-    }
+    parts = sum(v for k, v in counts.items() if k != "total")
+    if parts != counts["total"]:
+        print(f"::error title=Status buckets don't add up::total={counts['total']} sum={parts}")
+    print(f"[status] {counts} (of which archived={archived}) skipped_not_live={skipped}")
+    return counts
+
+
+def _verify_and_leave(client, me_id, c) -> dict:
+    """Re-checks ONE candidate against Telegram's CURRENT state right before
+    leaving (the admin's Yes can come hours after the scan: a group may have
+    grown past the member threshold, been un-muted, or the account may have
+    been made admin since). Only leaves if it still qualifies under ANY leave
+    reason; anything unverifiable is skipped, never left on a guess."""
+    peer_id = c["peer_id"]
+    entity = client.get_entity(int(peer_id))  # fresh fetch, not the scan-time snapshot
+
+    live, why = is_live_group(entity)
+    if not live:
+        return {"peer_id": peer_id, "status": "skipped", "detail": f"not_a_member_anymore:{why}"}
+
+    info = evaluate(client, entity, me_id, _now())
+    if info["bucket"] == "unchecked":
+        return {"peer_id": peer_id, "status": "skipped", "detail": f"verify_failed:{info.get('error')}"}
+    reason, _ = leave_reason(client, entity, info)
+    if not reason:
+        return {"peer_id": peer_id, "status": "skipped", "detail": "no_longer_matches_any_leave_reason"}
+
+    # delete_dialog picks the right underlying call (LeaveChannel for
+    # channels/supergroups, DeleteChatUser for legacy groups).
+    client.delete_dialog(entity)
+    print(f"[leave] left {peer_id} ({c.get('title', '')}) -- verified reason now: {reason}")
+    return {"peer_id": peer_id, "status": "left", "detail": ""}
 
 
 def leave_confirmed_groups(client, candidates: list) -> tuple:
-    """Returns (results, aborted_early)."""
+    """Returns (results, aborted_early). Result statuses: left | skipped
+    (re-check says it no longer qualifies / can't be verified) | failed."""
     # get_entity(int_id) alone can fail to resolve a channel in a *fresh*
-    # session ("Could not find the input entity") because Telethon needs an
-    # access_hash it only learns by having seen the entity via a dialogs
-    # call first. iter_dialogs() here warms that cache for every group this
-    # account is currently in, which covers all of `candidates` since they
-    # were all found via a scan on this same account.
+    # session because Telethon needs an access_hash it only learns from a
+    # dialogs call first; iter_dialogs() warms that cache for every group
+    # this account is in.
     list(client.iter_dialogs())
+    me_id = client.get_me().id
 
     results = []
     aborted_early = False
@@ -393,13 +441,7 @@ def leave_confirmed_groups(client, candidates: list) -> tuple:
     for c in candidates:
         peer_id = c["peer_id"]
         try:
-            entity = client.get_entity(int(peer_id))
-            # delete_dialog picks the right underlying leave/delete call for
-            # whatever entity type this is (Channel vs legacy Chat) -- no
-            # need to hand-pick LeaveChannelRequest vs DeleteChatUserRequest.
-            client.delete_dialog(entity)
-            results.append({"peer_id": peer_id, "status": "left", "detail": ""})
-            print(f"[leave] left {peer_id} ({c.get('title', '')})")
+            res = _verify_and_leave(client, me_id, c)
         except FloodWaitError as e:
             if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
                 results.append({"peer_id": peer_id, "status": "failed",
@@ -408,28 +450,26 @@ def leave_confirmed_groups(client, candidates: list) -> tuple:
             print(f"[leave] FloodWait {e.seconds}s -- sleeping")
             time.sleep(e.seconds + 1)
             try:
-                entity = client.get_entity(int(peer_id))
-                client.delete_dialog(entity)
-                results.append({"peer_id": peer_id, "status": "left", "detail": ""})
+                res = _verify_and_leave(client, me_id, c)
             except Exception as e2:
-                results.append({"peer_id": peer_id, "status": "failed",
-                                 "detail": f"unexpected_error:{type(e2).__name__}"})
+                res = {"peer_id": peer_id, "status": "failed",
+                       "detail": f"unexpected_error:{type(e2).__name__}"}
         except PeerFloodError:
-            # Same reasoning as join_telegram.py's PeerFloodError handling --
-            # an account-wide anti-spam signal, not a per-group problem. Stop
-            # leaving MORE groups this run; whatever's left stays 'pending'
-            # and gets picked up by the next 3-day scan cycle.
+            # Account-wide anti-spam signal, not a per-group problem. Stop
+            # leaving MORE groups this run; whatever's left stays 'pending'.
             results.append({"peer_id": peer_id, "status": "failed", "detail": "peer_flood_detected"})
             aborted_early = True
             break
         except RPCError as e:
-            results.append({"peer_id": peer_id, "status": "failed",
-                             "detail": f"rpc_error_{type(e).__name__}"})
+            res = {"peer_id": peer_id, "status": "failed", "detail": f"rpc_error_{type(e).__name__}"}
         except Exception as e:
-            results.append({"peer_id": peer_id, "status": "failed",
-                             "detail": f"unexpected_error:{type(e).__name__}:{str(e)[:150]}"})
+            res = {"peer_id": peer_id, "status": "failed",
+                   "detail": f"unexpected_error:{type(e).__name__}:{str(e)[:150]}"}
 
-        time.sleep(random.uniform(*LEAVE_PER_GROUP_DELAY_SECONDS))
+        results.append(res)
+        # Only a real leave is a "peer action" worth the long pacing delay.
+        delay = LEAVE_PER_GROUP_DELAY_SECONDS if res["status"] == "left" else SCAN_PER_GROUP_DELAY_SECONDS
+        time.sleep(random.uniform(*delay))
 
     return results, aborted_early
 

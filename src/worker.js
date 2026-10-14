@@ -573,6 +573,11 @@ async function handleLeaveReport(request, env) {
     const restricted = Number(body.restricted) || 0;
     const paidMessages = Number(body.paid_messages) || 0;
     const readOnly = Number(body.read_only) || 0;
+    // 2026-10-15: broadcast channels (members can't post) are their own bucket now
+    // instead of inflating "active"; "unchecked" = groups Telegram wouldn't let the
+    // scan read (only shown when non-zero) so total always equals the sum of the lines.
+    const broadcast = Number(body.broadcast) || 0;
+    const unchecked = Number(body.unchecked) || 0;
 
     await notifyAdmin(
       env,
@@ -581,7 +586,9 @@ async function handleLeaveReport(request, env) {
         `active groups - ${active}\n` +
         `restricted groups - ${restricted}\n` +
         `paid message groups - ${paidMessages}\n` +
-        `read only groups - ${readOnly}`
+        `read only groups - ${readOnly}\n` +
+        `channels (view-only) - ${broadcast}` +
+        (unchecked ? `\nunchecked (Telegram error, see Actions log) - ${unchecked}` : "")
     );
     return new Response("OK", { status: 200 });
   }
@@ -646,6 +653,7 @@ async function handleLeaveReport(request, env) {
           let note = "";
           if (c.reason === "under_50_members" && c.member_count != null) note = ` (${c.member_count} members)`;
           else if (c.reason === "paid_messages" && c.stars_price != null) note = ` (${c.stars_price}⭐/msg)`;
+          else if (c.reason === "muted" && c.muted_until) note = ` (ယာယီ mute — ${String(c.muted_until).slice(0, 10)} အထိ)`;
           return `${i + 1}. ${(c.title || "(no title)").slice(0, MAX_TITLE_LENGTH)}${note}`;
         })
         .join("\n");
@@ -694,13 +702,16 @@ async function handleLeaveReport(request, env) {
             .prepare(
               "UPDATE leave_candidates SET status = ?, detail = ?, updated_at = ? WHERE scan_id = ? AND peer_id = ?"
             )
-            .bind(r.status === "left" ? "left" : "failed", r.detail || "", now, scanId, String(r.peer_id))
+            .bind(r.status === "left" ? "left" : r.status === "skipped" ? "skipped" : "failed", r.detail || "", now, scanId, String(r.peer_id))
         )
       );
     }
 
     const leftCount = results.filter((r) => r.status === "left").length;
-    const failedCount = results.length - leftCount;
+    // "skipped" = the leave-time re-check found the group no longer qualifies (or
+    // couldn't be verified) -- deliberately not left, and not a failure.
+    const skippedCount = results.filter((r) => r.status === "skipped").length;
+    const failedCount = results.length - leftCount - skippedCount;
     await env.DB.prepare(
       "UPDATE leave_scans SET status = 'done', left_count = ?, failed_count = ?, updated_at = ? WHERE id = ?"
     ).bind(leftCount, failedCount, now, scanId).run();
@@ -714,7 +725,7 @@ async function handleLeaveReport(request, env) {
 
     await notifyAdmin(
       env,
-      `✅ [${account}] Groups leaving ပြီးသွားပါပြီ — ${leftCount} ခု ထွက်ပြီး, ${failedCount} ခု fail (Auto-join ပြန်စပါပြီ)${remainingNote}`
+      `✅ [${account}] Groups leaving ပြီးသွားပါပြီ — ${leftCount} ခု ထွက်ပြီး, ${skippedCount} ခု ကျော် (Leave မလုပ်ခင် ပြန်စစ်တော့ အခြေအနေ ပြောင်းသွားလို့), ${failedCount} ခု fail (Auto-join ပြန်စပါပြီ)${remainingNote}`
     );
     return new Response("OK", { status: 200 });
   }
@@ -1291,7 +1302,7 @@ const BOT_COMMANDS = [
   { command: "start", description: "Bot စတင်ရန် — usage message ပြရန်" },
   { command: "status", description: "Queue status (account တစ်ခုချင်းစီ)" },
   { command: "leavescan", description: "Muted group scan စတင်ရန် (account ရွေးရမယ်, admin ကိုယ်တိုင် ခေါ်မှ run)" },
-  { command: "account_status", description: "Account status — Total/active/restricted/paid/read-only group count (account ရွေးရမယ်)" },
+  { command: "account_status", description: "Account status — Total/active/restricted/paid/read-only/channel group count (account ရွေးရမယ်)" },
   { command: "sync_menu", description: "ဒီ Bot Menu ခလုတ်ကို command list အသစ်နဲ့ sync ပြန်ရန်" },
   { command: "help", description: "ဒီ usage message ပြန်ပြရန်" },
 ];

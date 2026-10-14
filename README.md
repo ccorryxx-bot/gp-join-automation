@@ -233,6 +233,24 @@ the reply; the other still starts.
 
 **Next test step:** send a **new** `t.me/...` or `t.me/+...` group invite link to the bot (not `/start` — this would be attempt #6, first one against the fix), confirm the "✅ Queued" reply, then watch the `join.yml` run in the Actions tab within ~1 minute (cron dispatcher tick). Check `join_queue` for `status='joined'` (or `already_member`) instead of `stale_no_report_timeout`.
 
+## Leave / status logic audit (2026-10-15)
+
+`scripts/leave_groups.py` was audited line by line against Telegram's own client library (tdlib) and Telethon's source, then covered by `tests/test_leave_logic.py` (22 offline cases, real Telethon TL types, fake network). Before the fixes the same suite passed 5 of 16 cases.
+
+| Was wrong | Fixed |
+|---|---|
+| A group the scan couldn't read (error / FloodWait) was counted in **Total** but in no bucket, so Total ≠ the sum of the lines, silently. FloodWait skipped the group instead of retrying. | Every group lands in exactly one bucket; unreadable ones show as `unchecked`; one FloodWait retry. Total = sum of buckets is asserted and logged. |
+| Migrated/deactivated legacy chats were counted (Telethon returns them unless `ignore_migrated`) — double count with their supergroup — and could be offered for leaving. | Skipped (`migrated_or_deactivated`), plus kicked/forbidden/left dialogs. |
+| Admins/creators in a read-only group showed as `read_only` (tdlib: admins ignore default restrictions), and **groups the account owns/admins with <50 members were offered for leaving**. | Admin/creator → `active`, never a leave candidate (also trusts Telegram's `ChannelParticipantAdmin/Creator` over a possibly stale flag). |
+| Broadcast channels (members can't post) were counted as `active groups`. | Own bucket `channels (view-only)`. |
+| Member count fallback used `channels.getParticipants`, which fails for non-admins in channels → count unknown → never flagged. | Uses GetFullChannel (`get_participants(limit=0)`), which Telethon documents as working without access. |
+| Expired restriction (`until_date` in the past) still counted as muted; temporary mutes looked permanent. | Expired = not muted; temporary mute is flagged with `muted_until` and shown as "ယာယီ mute". Note Telethon returns 1970-01-01 (not `None`) for `until_date=0`. |
+| The leave step trusted the scan snapshot — a Yes hours later could leave a group that has since grown past 50, been un-muted, or where the account became admin. | Each candidate is re-verified against fresh Telegram state right before leaving; anything that no longer qualifies or can't be verified is `skipped`, never left on a guess. |
+
+`scan` and `status` previously each had their own copy of the classification; they now share one `evaluate()`.
+
+**Not provable offline (check live):** what Telegram actually returns for a given account. After deploy run `/account_status` for one account and read the Actions log line `[status] {...} (of which archived=N) skipped_not_live={...}` — it confirms archived groups are included, shows how many dead dialogs were excluded, and `unchecked` shows any group Telegram refused to describe. Member counts are Telegram's total (bots included; Telegram offers no cheap human-only figure).
+
 ## Secrets
 
 ### Naming convention (added 2026-09-22)
