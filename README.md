@@ -59,7 +59,9 @@ A bare single URL (no brackets) still works as before. Behavior:
 
 **Not yet live-tested** — needs a real multi-URL message sent to the bot once deployed, watching `join_queue` to confirm rows go `queued → triggered → joined/failed` one at a time with the expected gap between them.
 
-## Multi-account (CH / JL) + admin gating (added 2026-09-22, Phase 7)
+## Multi-account (CH / JL / HHNC / NAWTHON) + admin gating (added 2026-09-22, Phase 7)
+
+> **2026-10-15:** HHNC and NAWTHON added as accounts 3 and 4. Everything below written about "CH / JL" applies to all four; account pickers show 2 buttons per row plus a full-width "All" button (callback value still `BOTH`, now meaning every account).
 
 **Second Telethon account.** A dedicated account "JL" joins the "CH" naming
 convention above (see Secrets). Its credentials live as GitHub Actions
@@ -245,7 +247,7 @@ Telegram-account-specific secrets are prefixed per account — `CH_` for the fir
 | `GH_PAT` | dispatcher | needs `workflow` scope, triggers join.yml |
 | `REPORT_SECRET` | /report | must match GitHub's `REPORT_SECRET` exactly — intentionally **not** account-prefixed (see naming convention above) |
 
-### GitHub Actions repo secrets (`gh secret set <name>`) — all 7 set ✅
+### GitHub Actions repo secrets (`gh secret set <name>`)
 
 | Secret | Used by | Notes |
 |---|---|---|
@@ -257,10 +259,22 @@ Telegram-account-specific secrets are prefixed per account — `CH_` for the fir
 | `JL_API_ID` | join.yml | from my.telegram.org, dedicated "JL" account — **added to secrets manually 2026-09-22, not via CI** |
 | `JL_API_HASH` | join.yml | from my.telegram.org, dedicated "JL" account — **added manually** |
 | `JL_STRING_SESSION` | join.yml | generated locally once, dedicated "JL" account — **added manually**, never commit |
+| `HHNC_API_ID` | join.yml, leave.yml | from my.telegram.org, dedicated "HHNC" account (added 2026-10-15, **added manually**) |
+| `HHNC_API_HASH` | join.yml, leave.yml | from my.telegram.org, dedicated "HHNC" account — **added manually** |
+| `HHNC_TG_SESSION` | join.yml, leave.yml | Telethon StringSession, dedicated "HHNC" account — **added manually**, never commit |
+| `NAWTHON_API_ID` | join.yml, leave.yml | from my.telegram.org, dedicated "NAWTHON" account (added 2026-10-15, **added manually**) |
+| `NAWTHON_API_HASH` | join.yml, leave.yml | from my.telegram.org, dedicated "NAWTHON" account — **added manually** |
+| `NAWTHON_TG_SESSION` | join.yml, leave.yml | Telethon StringSession, dedicated "NAWTHON" account — **added manually**, never commit |
 | `WORKER_REPORT_URL` | join.yml | `https://gp-join-automation.ccorryxx.workers.dev` |
 | `REPORT_SECRET` | join.yml | must match Cloudflare's `REPORT_SECRET` exactly |
 
-> `join.yml` picks between the CH_* and JL_* secret sets based on the `account` workflow input (`inputs.account == 'JL' && secrets.JL_API_ID || secrets.CH_TG_API_ID`, same pattern for the other two) and maps the result to the plain `TG_API_ID` / `TG_API_HASH` / `TG_SESSION_STRING` env vars `scripts/join_telegram.py` expects. Note JL's secret names deliberately don't carry the same `_TG_` / `SESSION_STRING` naming as CH's — they were added as `JL_API_ID` / `JL_API_HASH` / `JL_STRING_SESSION`, and the workflow routes to those exact names.
+> **Account → secret routing (2026-10-15).** `join.yml` and `leave.yml` pass **every** account's secrets in as env vars; `scripts/tg_accounts.py` (`ACCOUNT_SECRETS`) picks the set matching the `account` input and builds the Telethon client. A missing/empty/non-numeric secret is a hard, named failure (`missing_secrets:HHNC_API_ID,...`) that is reported back through `/report` like any other join failure — it does **not** fall back to another account's credentials (the old `a && b || c` workflow ternary would have, silently). Secret names per account are not uniform (CH/JL keep the names they were created with), which is why the mapping is an explicit table in `tg_accounts.py` rather than a naming rule.
+
+### Adding another Telethon account
+1. Add its 3 GitHub secrets (API id / API hash / StringSession).
+2. Add a row to `ACCOUNT_SECRETS` in `scripts/tg_accounts.py` and the env lines in `join.yml` + `leave.yml`.
+3. Add the name to the `account` choice options in `join.yml` + `leave.yml` — GitHub rejects a dispatch (HTTP 422) for a value not in that list.
+4. Add it to `ACCOUNTS` in `src/worker.js` (pickers, dispatcher lanes, `/status` and the "All" buttons follow automatically). No D1 migration needed — `account` is a plain TEXT column with no CHECK constraint.
 
 ### Cloudflare Worker plain vars (`wrangler.toml` `[vars]`, deployed via CI)
 

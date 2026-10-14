@@ -16,10 +16,25 @@
 const KV_DEDUP_TTL_SECONDS = 600; // 10 min — covers Telegram's webhook retry window
 const REPORT_STATUSES = new Set(["joined", "already_member", "pending_approval", "failed"]);
 
-// Add a 3rd entry here (+ its GitHub secrets + join.yml choice option) to
-// extend to another Telethon account later — everything else in this file
-// (dedup, dispatch, pacing) is already generic over this list.
-const ACCOUNTS = ["CH", "JL"];
+// Add an entry here (+ its GitHub secrets, its row in scripts/tg_accounts.py
+// ACCOUNT_SECRETS, and the join.yml / leave.yml choice options) to extend to
+// another Telethon account — everything else in this file (dedup, dispatch,
+// pacing) is already generic over this list.
+// 2026-10-15: HHNC + NAWTHON added (4 accounts total).
+const ACCOUNTS = ["CH", "JL", "HHNC", "NAWTHON"];
+
+// Inline-keyboard rows for an account picker: 2 accounts per row (4 buttons
+// in one row gets clipped on phones), then an optional full-width "All" row.
+// The "BOTH" callback value is kept as-is on purpose — it now means "every
+// account", but renaming it would break picker messages already sitting in
+// the admin's chat.
+function accountPickerRows(label, callbackPrefix, allLabel) {
+  const buttons = ACCOUNTS.map((a) => ({ text: `${label} ${a}`, callback_data: `${callbackPrefix}:${a}` }));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  if (allLabel) rows.push([{ text: allLabel, callback_data: `${callbackPrefix}:BOTH` }]);
+  return rows;
+}
 
 // How long an account-selection prompt stays valid. If the admin doesn't tap
 // a button within this window, the pending URLs are dropped from KV and the
@@ -1287,7 +1302,7 @@ const HELP_TEXT = [
   "Group link ပို့ပါ — line တစ်ကြောင်းကို link တစ်ခုစီ (numbered list ဖြစ်နိုင်တယ်):",
   "1. https://t.me/+xxxxxxxxxxxx",
   "2. https://t.me/+yyyyyyyyyyyy",
-  "URL ဘေးနားမှာ extra စာသား မကပ်ပါစေနဲ့ — ဘယ် account (CH / JL) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
+  "URL ဘေးနားမှာ extra စာသား မကပ်ပါစေနဲ့ — ဘယ် account (CH / JL / HHNC / NAWTHON) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
   "",
   ...BOT_COMMANDS.map((c) => `/${c.command} — ${c.description}`),
 ].join("\n");
@@ -1545,8 +1560,8 @@ async function replyToUser(env, chatId, text) {
   return data?.result?.message_id ?? null;
 }
 
-// Phase 7: sends the CH / JL picker as an inline keyboard. callback_data is
-// "acct:CH" / "acct:JL", read back in handleCallbackQuery.
+// Phase 7: sends the account picker as an inline keyboard. callback_data is
+// "acct:<ACCOUNT>" (e.g. "acct:CH"), read back in handleCallbackQuery.
 async function sendAccountPrompt(env, chatId, validCount, invalidCount, unsupportedCount) {
   const invalidNote = invalidCount ? `\n❌ Format မမှန်လို့ ကျော်လိုက်တာ — ${invalidCount} link` : "";
   const unsupportedNote = unsupportedCount
@@ -1561,7 +1576,7 @@ async function sendAccountPrompt(env, chatId, validCount, invalidCount, unsuppor
       chat_id: chatId,
       text,
       reply_markup: {
-        inline_keyboard: [ACCOUNTS.map((a) => ({ text: `Account ${a}`, callback_data: `acct:${a}` }))],
+        inline_keyboard: accountPickerRows("Account", "acct"),
       },
     }),
   });
@@ -1581,12 +1596,7 @@ async function sendLeaveScanPrompt(env, chatId) {
       chat_id: chatId,
       text: "🔍 Muted group scan — ဘယ် Account ကို scan မလဲ ရွေးပါ 👇",
       reply_markup: {
-        inline_keyboard: [
-          [
-            ...ACCOUNTS.map((a) => ({ text: `Scan ${a}`, callback_data: `leavescan:${a}` })),
-            { text: "Scan Both", callback_data: "leavescan:BOTH" },
-          ],
-        ],
+        inline_keyboard: accountPickerRows("Scan", "leavescan", "Scan All"),
       },
     }),
   });
@@ -1596,7 +1606,7 @@ async function sendLeaveScanPrompt(env, chatId) {
 }
 
 // /account_status: same CH/JL picker style as sendLeaveScanPrompt, plus a
-// 3rd "Both" option that fires the status scan for both accounts at once.
+// "All" option that fires the status scan for every account at once.
 // There's no merged/combined count — each account still reports back (and
 // gets its own Telegram message) independently, same as two separate taps.
 async function sendAccountStatusPrompt(env, chatId) {
@@ -1607,12 +1617,7 @@ async function sendAccountStatusPrompt(env, chatId) {
       chat_id: chatId,
       text: "📊 Account status — ဘယ် Account ကို check မလဲ ရွေးပါ 👇",
       reply_markup: {
-        inline_keyboard: [
-          [
-            ...ACCOUNTS.map((a) => ({ text: `Status ${a}`, callback_data: `acctstatus:${a}` })),
-            { text: "Status Both", callback_data: "acctstatus:BOTH" },
-          ],
-        ],
+        inline_keyboard: accountPickerRows("Status", "acctstatus", "Status All"),
       },
     }),
   });

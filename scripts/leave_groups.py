@@ -34,7 +34,7 @@ Phase 8 (2026-09-23): "leave muted groups" automation, invoked by
                nothing to confirm or leave later) but still required/sent
                for a consistent report payload shape across modes.
 
-Env vars (required): TG_API_ID, TG_API_HASH, TG_SESSION_STRING, ACCOUNT,
+Env vars (required): ACCOUNT (credentials resolved by tg_accounts.py),
 MODE, SCAN_ID -- see leave.yml for where these come from.
 
 Env vars (optional): REPORT_URL, REPORT_SECRET -- same as join_telegram.py.
@@ -58,15 +58,11 @@ import time
 import urllib.error
 import urllib.request
 
-from telethon.sync import TelegramClient
+from tg_accounts import make_client
 from telethon.errors import FloodWaitError, PeerFloodError, RPCError
-from telethon.sessions import StringSession
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import ChannelParticipantBanned
 
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
-SESSION_STRING = os.environ["TG_SESSION_STRING"]
 ACCOUNT = os.environ.get("ACCOUNT", "CH")
 MODE = os.environ["MODE"]  # "scan" | "leave"
 SCAN_ID = os.environ["SCAN_ID"]
@@ -443,7 +439,7 @@ def main():
 
     if MODE == "scan":
         try:
-            with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
+            with make_client(ACCOUNT) as client:
                 total, candidates = scan_leave_candidates(client)
         except Exception as e:
             print(f"[unexpected] scan failed: {type(e).__name__}: {e}")
@@ -470,7 +466,7 @@ def main():
             return
 
         try:
-            with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
+            with make_client(ACCOUNT) as client:
                 results, aborted_early = leave_confirmed_groups(client, candidates)
         except Exception as e:
             print(f"[unexpected] leave failed: {type(e).__name__}: {e}")
@@ -485,7 +481,7 @@ def main():
 
     if MODE == "status":
         try:
-            with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
+            with make_client(ACCOUNT) as client:
                 counts = scan_account_status(client)
         except Exception as e:
             print(f"[unexpected] status scan failed: {type(e).__name__}: {e}")

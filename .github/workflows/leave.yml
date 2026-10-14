@@ -9,6 +9,8 @@ on:
         options:
           - CH
           - JL
+          - HHNC
+          - NAWTHON
         default: CH
       mode:
         description: "scan (read-only check), leave (actually leave confirmed groups), or status (read-only group-count snapshot for /account_status)"
@@ -54,11 +56,21 @@ jobs:
 
       - name: Scan or leave muted groups
         env:
-          # Same account -> secret-name ternary as join.yml (see that file's
-          # comment for why CH and JL don't share a naming pattern).
-          TG_API_ID: ${{ inputs.account == 'JL' && secrets.JL_API_ID || secrets.CH_TG_API_ID }}
-          TG_API_HASH: ${{ inputs.account == 'JL' && secrets.JL_API_HASH || secrets.CH_TG_API_HASH }}
-          TG_SESSION_STRING: ${{ inputs.account == 'JL' && secrets.JL_STRING_SESSION || secrets.CH_TG_SESSION_STRING }}
+          # Every account's secrets are passed in; scripts/tg_accounts.py picks the
+          # set matching ACCOUNT and fails loudly if any is missing (a workflow
+          # `a && b || c` chain would silently fall back to CH's credentials).
+          CH_TG_API_ID: ${{ secrets.CH_TG_API_ID }}
+          CH_TG_API_HASH: ${{ secrets.CH_TG_API_HASH }}
+          CH_TG_SESSION_STRING: ${{ secrets.CH_TG_SESSION_STRING }}
+          JL_API_ID: ${{ secrets.JL_API_ID }}
+          JL_API_HASH: ${{ secrets.JL_API_HASH }}
+          JL_STRING_SESSION: ${{ secrets.JL_STRING_SESSION }}
+          HHNC_API_ID: ${{ secrets.HHNC_API_ID }}
+          HHNC_API_HASH: ${{ secrets.HHNC_API_HASH }}
+          HHNC_TG_SESSION: ${{ secrets.HHNC_TG_SESSION }}
+          NAWTHON_API_ID: ${{ secrets.NAWTHON_API_ID }}
+          NAWTHON_API_HASH: ${{ secrets.NAWTHON_API_HASH }}
+          NAWTHON_TG_SESSION: ${{ secrets.NAWTHON_TG_SESSION }}
           ACCOUNT: ${{ inputs.account }}
           MODE: ${{ inputs.mode }}
           SCAN_ID: ${{ inputs.scan_id }}

@@ -2,8 +2,9 @@
 Phase 4: Telethon join logic, invoked by .github/workflows/join.yml
 
 Env vars (required):
-  TG_API_ID, TG_API_HASH, TG_SESSION_STRING  - dedicated Telethon account creds
-  GROUP_URL, QUEUE_ID                        - passed from workflow_dispatch inputs
+  ACCOUNT                  - CH / JL / HHNC / NAWTHON; picks which account's secrets
+                             tg_accounts.py loads (see ACCOUNT_SECRETS there)
+  GROUP_URL, QUEUE_ID      - passed from workflow_dispatch inputs
 
 Env vars (optional):
   REPORT_URL, REPORT_SECRET - base URL of the Worker (e.g.
@@ -24,15 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-# telethon.sync wraps every client method (including __call__) so it runs
-# synchronously with no `await` and no running event loop. Plain
-# `from telethon import TelegramClient` does NOT do this -- __call__ stays a
-# bare coroutine function, so calling it unawaited just builds a coroutine
-# object and silently drops it (RuntimeWarning: coroutine
-# 'UserMethods.__call__' was never awaited) -- the request never reaches
-# Telegram, no exception is raised, and the old code fell straight through
-# to `return "joined", ""`. https://docs.telethon.dev/en/stable/basic/quick-start.html
-from telethon.sync import TelegramClient
+from tg_accounts import make_client  # telethon.sync lives there -- see its comment
 from telethon.errors import (
     ChannelPrivateError,
     ChannelsTooMuchError,
@@ -45,19 +38,14 @@ from telethon.errors import (
     UserAlreadyParticipantError,
     UserBannedInChannelError,
 )
-from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
-SESSION_STRING = os.environ["TG_SESSION_STRING"]
 GROUP_URL = os.environ["GROUP_URL"]
 QUEUE_ID = os.environ["QUEUE_ID"]
-# Phase 7: which Telethon account this run uses (CH / JL). join.yml already
-# picked the matching TG_API_ID/TG_API_HASH/TG_SESSION_STRING secrets based
-# on this -- it's read here purely for clearer logs when both accounts may
-# have runs in the Actions log around the same time.
+# Which Telethon account this run uses (CH / JL / HHNC / NAWTHON). join.yml
+# passes every account's secrets in; tg_accounts.load_credentials(ACCOUNT)
+# picks this account's set and fails loudly if any is missing.
 ACCOUNT = os.environ.get("ACCOUNT", "CH")
 REPORT_URL = os.environ.get("REPORT_URL", "").rstrip("/")
 REPORT_SECRET = os.environ.get("REPORT_SECRET", "")
@@ -223,7 +211,7 @@ def main():
     # this script silently -- that leaves the row stuck at 'triggered' forever
     # with no /report ever sent and the user left wondering what happened.
     try:
-        with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
+        with make_client(ACCOUNT) as client:
             status, detail = join_with_floodwait_handling(client, kind, identifier)
     except Exception as e:
         status, detail = "failed", f"unexpected_error:{type(e).__name__}:{str(e)[:150]}"

@@ -15,6 +15,8 @@ on:
         options:
           - CH
           - JL
+          - HHNC
+          - NAWTHON
         default: CH
 
 # Defense-in-depth alongside the Worker's own in-flight check
@@ -26,9 +28,9 @@ on:
 # already going.
 #
 # Phase 7 (2026-09-22): per-account group, as this comment originally
-# predicted -- CH and JL each get their own lane, so a run for one account
-# is queued behind that SAME account's in-progress run, but never blocks
-# the other account from joining in parallel.
+# predicted -- every account (CH / JL / HHNC / NAWTHON) gets its own lane, so
+# a run for one account is queued behind that SAME account's in-progress run,
+# but never blocks the other accounts from joining in parallel.
 concurrency:
   group: telegram-join-${{ inputs.account }}
   # NEVER true here. Cancelling an in-progress run mid-join can leave
@@ -56,14 +58,21 @@ jobs:
 
       - name: Join Telegram group
         env:
-          # Phase 7: CH keeps its original secret names (TG_ in the middle,
-          # SESSION_STRING order) since those were already live; JL's names
-          # are whatever was set when the secrets were added
-          # (JL_API_ID / JL_API_HASH / JL_STRING_SESSION) -- this ternary
-          # just routes to the right set based on the account input.
-          TG_API_ID: ${{ inputs.account == 'JL' && secrets.JL_API_ID || secrets.CH_TG_API_ID }}
-          TG_API_HASH: ${{ inputs.account == 'JL' && secrets.JL_API_HASH || secrets.CH_TG_API_HASH }}
-          TG_SESSION_STRING: ${{ inputs.account == 'JL' && secrets.JL_STRING_SESSION || secrets.CH_TG_SESSION_STRING }}
+          # Every account's secrets are passed in; scripts/tg_accounts.py picks the
+          # set matching ACCOUNT and fails loudly if any is missing (a workflow
+          # `a && b || c` chain would silently fall back to CH's credentials).
+          CH_TG_API_ID: ${{ secrets.CH_TG_API_ID }}
+          CH_TG_API_HASH: ${{ secrets.CH_TG_API_HASH }}
+          CH_TG_SESSION_STRING: ${{ secrets.CH_TG_SESSION_STRING }}
+          JL_API_ID: ${{ secrets.JL_API_ID }}
+          JL_API_HASH: ${{ secrets.JL_API_HASH }}
+          JL_STRING_SESSION: ${{ secrets.JL_STRING_SESSION }}
+          HHNC_API_ID: ${{ secrets.HHNC_API_ID }}
+          HHNC_API_HASH: ${{ secrets.HHNC_API_HASH }}
+          HHNC_TG_SESSION: ${{ secrets.HHNC_TG_SESSION }}
+          NAWTHON_API_ID: ${{ secrets.NAWTHON_API_ID }}
+          NAWTHON_API_HASH: ${{ secrets.NAWTHON_API_HASH }}
+          NAWTHON_TG_SESSION: ${{ secrets.NAWTHON_TG_SESSION }}
           ACCOUNT: ${{ inputs.account }}
           GROUP_URL: ${{ inputs.group_url }}
           QUEUE_ID: ${{ inputs.queue_id }}
