@@ -251,6 +251,24 @@ the reply; the other still starts.
 
 **Not provable offline (check live):** what Telegram actually returns for a given account. After deploy run `/account_status` for one account and read the Actions log line `[status] {...} (of which archived=N) skipped_not_live={...}` — it confirms archived groups are included, shows how many dead dialogs were excluded, and `unchecked` shows any group Telegram refused to describe. Member counts are Telegram's total (bots included; Telegram offers no cheap human-only figure).
 
+## Leave / status logic audit #2 (2026-10-17)
+
+Owner's rule: **active = the account can send messages in that group.** Anything where it can't (muted, read-only, paid messages, view-only channel) is not active, and **an active group is never a leave candidate**, whatever its size.
+
+| Was wrong | Evidence | Fixed |
+|---|---|---|
+| Muted / read-only was detected only through the legacy `send_messages` flag. Telegram's own software writes the text restriction into `send_plain` instead, so a muted member or read-only group could be counted as **active** (status over-counted active, scan missed mutes). | tdlib `RestrictedRights::get_chat_banned_rights()` sends `send_messages=false` and uses `send_plain`; it is the path behind `channels.editBanned`, and the Bot API server is built on tdlib. tdlib reads only `send_plain` as "can send text". Android's permission editor "Send messages" toggle flips `send_plain` (`ChatRightsEditActivity`). | `text_banned()` = `send_messages OR send_plain`, used by both the mute and the read-only check. |
+| Groups with < 50 members were offered for leaving even when the account **could send there** (the "under_50_members" reason). A forged/stale candidate row for such a group was actually left. | Reproduced by the new tests A1, A3, A4 before the fix (A4: 16 of 882 generated situations). | Active groups are never candidates; `_verify_and_leave` has a hard `active_never_left` stop. The threshold now applies to view-only (broadcast) channels only. |
+| A failed status/scan run (bad session, Telegram error) sent all-zero counts, which the Worker showed as a real result ("Total groups - 0", or a scan marked `done` with "no candidates"). | Reproduced against the previous `worker.js` by `tests/test_worker_leave_report.mjs`. | Scripts send `{error}`; the Worker shows ❌ and marks the scan `failed` (the status `/leavescan` already uses; it does not block the next scan). |
+| A Telethon too old to expose `send_paid_messages_stars` / `send_plain` would silently count paid and muted groups as active (`getattr(..., None)`). | `pip install telethon` in `leave.yml` is unpinned. | `_require_tl_fields()` fails the run loudly (verified fields exist in Telethon 1.45.0, TL layer 229). |
+
+Tests (offline): `python tests/test_leave_logic.py` (40 cases, incl. an invariant over generated situations) and `node tests/test_worker_leave_report.mjs` (6 cases).
+
+**Not provable offline / known limits**
+- What Telegram's servers return for a given group (`send_plain` vs legacy `send_messages`): `text_banned()` accepts either, but confirm live — run `/account_status` and compare the counts with the Telegram app.
+- "Can't send" means the text permission is off. Telegram's own "sending not allowed" banner additionally requires every media type to be off (`ChatActivity.java`), so a member who may post photos but not text is counted as restricted here.
+- Members who boosted a group are exempt from its default restrictions in Telegram (tdlib `is_booster`). Not modelled; such a group would show as `read_only`.
+
 ## Secrets
 
 ### Naming convention (added 2026-09-22)

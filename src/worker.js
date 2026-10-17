@@ -568,6 +568,19 @@ async function handleLeaveReport(request, env) {
     // for this mode.
     await env.DEDUP_KV.delete(statusRunningKvKey(account));
 
+    // 2026-10-17: scripts/leave_groups.py now sends {error} when the run itself
+    // failed (bad session, Telegram/network error, outdated Telethon). Before
+    // this, it sent all-zero counts and the admin saw "Total groups - 0 /
+    // active groups - 0" as if that were the real answer.
+    if (body.error) {
+      await notifyAdmin(
+        env,
+        `❌ [${account}] Status check မအောင်မြင်ပါ — ${String(body.error).slice(0, 200)}\n\n` +
+          `Group အရေအတွက် မပြပါဘူး (မှားတဲ့ data မပြချင်လို့ပါ)။ GitHub Actions log ကြည့်ပါ။`
+      );
+      return new Response("OK", { status: 200 });
+    }
+
     const total = Number(body.total) || 0;
     const active = Number(body.active) || 0;
     const restricted = Number(body.restricted) || 0;
@@ -594,6 +607,21 @@ async function handleLeaveReport(request, env) {
   }
 
   if (mode === "scan") {
+    // 2026-10-17: same rule as status — a failed scan must not look like a
+    // clean "0 groups, nothing to leave" result. 'failed' is the status
+    // triggerLeaveScan already uses for a scan that never ran, and (unlike
+    // 'awaiting_confirm') it does not block the next /leavescan.
+    if (body.error) {
+      await env.DB.prepare("UPDATE leave_scans SET status = 'failed', updated_at = ? WHERE id = ?")
+        .bind(Date.now(), scanId).run();
+      await notifyAdmin(
+        env,
+        `❌ [${account}] Scan မအောင်မြင်ပါ — ${String(body.error).slice(0, 200)}\n\n` +
+          `"Leave candidate မရှိဘူး" ဆိုတဲ့ အဓိပ္ပာယ် မဟုတ်ပါ။ GitHub Actions log ကြည့်ပြီး /leavescan ပြန်လုပ်ပါ။`
+      );
+      return new Response("OK", { status: 200 });
+    }
+
     const candidates = Array.isArray(body.candidates) ? body.candidates : [];
     const totalDialogs = Number(body.total_dialogs) || 0;
     const now = Date.now();

@@ -3,16 +3,18 @@ Phase 8 (2026-09-23): "leave muted groups" automation, invoked by
 .github/workflows/leave.yml. Two modes, selected by MODE:
 
   MODE=scan  - read-only. Iterates every dialog for this account and flags
-               two kinds of candidates: groups/supergroups where Telegram
-               shows this account as admin-restricted (banned_rights.
-               send_messages=True but view_messages=False -- i.e. "muted",
-               not fully kicked/banned), and (Phase 9, 2026-09-26) any
-               group/channel with fewer than MIN_MEMBERS_THRESHOLD total
-               members. Reports the full candidate list (each tagged with
-               its reason) back to the Worker in a single POST to
-               /leave-report (mode=scan). The Worker then asks the admin a
-               single Y/N confirm in Telegram covering BOTH reasons at once
-               before anything actually leaves.
+               groups where this account CANNOT send messages: muted
+               (admin-restricted: text banned but view_messages=False, i.e.
+               not fully kicked/banned), read_only (sending off for everyone),
+               paid_messages (Stars per message), and view-only channels
+               with fewer than MIN_MEMBERS_THRESHOLD members. A group where
+               the account CAN send messages is "active" and is NEVER a
+               candidate, whatever its size (owner's rule, 2026-10-17; before
+               that, small active groups were offered as "under_50_members").
+               Reports the full candidate list (each tagged with its reason)
+               back to the Worker in a single POST to /leave-report
+               (mode=scan). The Worker then asks the admin a single Y/N
+               confirm in Telegram before anything actually leaves.
 
   MODE=leave - destructive. Fetches the admin-confirmed candidate list for
                SCAN_ID from the Worker's /leave-candidates endpoint, then
@@ -50,6 +52,7 @@ one batch, some individual failures are a normal outcome the admin is
 already told about in the finish notice, not a CI-red event.
 """
 
+import inspect
 import json
 import os
 import random
@@ -69,11 +72,12 @@ from telethon.tl.types import (
     ChannelParticipantCreator,
     ChannelParticipantLeft,
     Chat,
+    ChatBannedRights,
     ChatForbidden,
 )
 
 ACCOUNT = os.environ.get("ACCOUNT", "CH")
-MODE = os.environ["MODE"]  # "scan" | "leave"
+MODE = os.environ["MODE"]  # "scan" | "leave" | "status"
 SCAN_ID = os.environ["SCAN_ID"]
 REPORT_URL = os.environ.get("REPORT_URL", "").rstrip("/")
 REPORT_SECRET = os.environ.get("REPORT_SECRET", "")
@@ -172,6 +176,24 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def _require_tl_fields(channel_cls=Channel, rights_cls=ChatBannedRights):
+    """Refuse to run on a Telethon whose TL schema lacks the fields the
+    classifier relies on. getattr(entity, "send_paid_messages_stars", None)
+    would quietly return None on an old schema and every paid group would be
+    counted as active; the same goes for send_plain on the rights object."""
+    chan = set(inspect.signature(channel_cls.__init__).parameters)
+    rights = set(inspect.signature(rights_cls.__init__).parameters)
+    missing = sorted(
+        ({"send_paid_messages_stars", "default_banned_rights", "gigagroup"} - chan)
+        | ({"send_plain", "send_messages", "view_messages", "until_date"} - rights))
+    if missing:
+        raise RuntimeError("telethon_too_old_missing_fields:" + ",".join(missing))
+
+
+def _error_text(e):
+    return f"{type(e).__name__}: {str(e)[:120]}"
+
+
 def is_live_group(entity):
     """(True, "") if this dialog is a group/channel the account is actually IN
     right now. Otherwise (False, why) -- such dialogs are neither counted nor
@@ -192,11 +214,29 @@ def is_admin(entity):
     return bool(getattr(entity, "creator", False) or getattr(entity, "admin_rights", None))
 
 
+def text_banned(rights):
+    """True if these ChatBannedRights forbid plain text messages -- the
+    Telegram permission literally called "Send messages".
+
+    Telegram has TWO text flags: the legacy `send_messages` and `send_plain`
+    (added with the granular media permissions). Telegram's own software
+    writes only `send_plain` when it mutes a member or makes a group
+    read-only: tdlib (which also runs the Bot API server behind moderator
+    bots) builds chatBannedRights with send_messages=false and puts the text
+    restriction in send_plain (td/telegram/DialogParticipant.cpp,
+    RestrictedRights::get_chat_banned_rights, used by channels.editBanned),
+    and the Android permission editor's "Send messages" toggle flips
+    send_plain as well (ChatRightsEditActivity). Reading only the legacy flag
+    missed those restrictions and counted such groups as active. Either flag
+    set = text banned."""
+    return bool(rights and (rights.send_messages or rights.send_plain))
+
+
 def mute_state(rights, now):
     """(muted_now, until). Muted = can't send text but can still view.
     until=None means permanent. A restriction whose until_date has passed is
     expired (tdlib treats it the same way) and is NOT muted."""
-    if not (rights and rights.send_messages and not rights.view_messages):
+    if not (rights and text_banned(rights) and not rights.view_messages):
         return False, None
     until = getattr(rights, "until_date", None)
     if until is None or until.timestamp() < 30:  # epoch / <30s == "forever"
@@ -275,7 +315,7 @@ def evaluate(client, entity, me_id, now):
 
     default_rights = getattr(entity, "default_banned_rights", None)
     stars = getattr(entity, "send_paid_messages_stars", None) if is_channel else None
-    if default_rights and default_rights.send_messages:
+    if default_rights and text_banned(default_rights):
         info["bucket"] = "read_only"      # group-wide: nobody but admins can send
     elif stars:
         info.update(bucket="paid_messages", stars_price=stars)
@@ -285,9 +325,10 @@ def evaluate(client, entity, me_id, now):
 
 
 def leave_reason(client, entity, info):
-    """Leave reason for an evaluated group, or None. Admin/creator groups are
-    NEVER leave candidates, and an unreadable group ("unchecked") can't be
-    judged so it isn't one either."""
+    """Leave reason for an evaluated group, or None. Only groups where this
+    account cannot send messages can have one. NEVER a candidate: an active
+    group (the account can send), an admin/creator group, or an unreadable
+    group ("unchecked") that can't be judged."""
     if info["admin"]:
         return None, {}
     bucket = info["bucket"]
@@ -297,10 +338,14 @@ def leave_reason(client, entity, info):
         return "read_only", {}
     if bucket == "paid_messages":
         return "paid_messages", {"stars_price": info["stars_price"]}
-    if bucket in ("active", "broadcast"):
+    if bucket == "broadcast":
+        # View-only channel: not active (members can't post). Size is the only
+        # signal we act on here.
         count = get_member_count(client, entity)
         if count is not None and count < MIN_MEMBERS_THRESHOLD:
             return "under_50_members", {"member_count": count}
+    # bucket == "active": the account can send messages here -> never a
+    # candidate, however small the group is.
     return None, {}
 
 
@@ -414,6 +459,11 @@ def _verify_and_leave(client, me_id, c) -> dict:
     info = evaluate(client, entity, me_id, _now())
     if info["bucket"] == "unchecked":
         return {"peer_id": peer_id, "status": "skipped", "detail": f"verify_failed:{info.get('error')}"}
+    if info["admin"] or info["bucket"] == "active":
+        # Hard stop, independent of leave_reason(): a group where this account
+        # can send messages is never left, whatever the (possibly stale or
+        # hand-edited) candidate row says.
+        return {"peer_id": peer_id, "status": "skipped", "detail": "active_never_left"}
     reason, _ = leave_reason(client, entity, info)
     if not reason:
         return {"peer_id": peer_id, "status": "skipped", "detail": "no_longer_matches_any_leave_reason"}
@@ -479,12 +529,15 @@ def main():
 
     if MODE == "scan":
         try:
+            _require_tl_fields()
             with make_client(ACCOUNT) as client:
                 total, candidates = scan_leave_candidates(client)
         except Exception as e:
             print(f"[unexpected] scan failed: {type(e).__name__}: {e}")
+            # An explicit error, NOT "0 groups / 0 candidates": the Worker would
+            # present that as a real, clean result.
             report({"mode": "scan", "account": ACCOUNT, "scan_id": SCAN_ID,
-                     "total_dialogs": 0, "candidates": []})
+                     "error": _error_text(e)})
             sys.exit(1)
 
         if not report({"mode": "scan", "account": ACCOUNT, "scan_id": SCAN_ID,
@@ -506,6 +559,7 @@ def main():
             return
 
         try:
+            _require_tl_fields()
             with make_client(ACCOUNT) as client:
                 results, aborted_early = leave_confirmed_groups(client, candidates)
         except Exception as e:
@@ -521,13 +575,15 @@ def main():
 
     if MODE == "status":
         try:
+            _require_tl_fields()
             with make_client(ACCOUNT) as client:
                 counts = scan_account_status(client)
         except Exception as e:
             print(f"[unexpected] status scan failed: {type(e).__name__}: {e}")
+            # An explicit error, NOT zero counts: the Worker would show
+            # "Total groups - 0 / active groups - 0" as if it were the result.
             report({"mode": "status", "account": ACCOUNT, "scan_id": SCAN_ID,
-                     "total": 0, "active": 0, "restricted": 0,
-                     "paid_messages": 0, "read_only": 0})
+                     "error": _error_text(e)})
             sys.exit(1)
 
         if not report({"mode": "status", "account": ACCOUNT, "scan_id": SCAN_ID, **counts}):

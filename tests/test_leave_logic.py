@@ -78,11 +78,12 @@ class FakeClient:
         return SimpleNamespace(participant=p)
     def get_participants(self, entity, limit=None):
         self.calls.append(("get_participants", entity.id, limit))
+        total = self.full_totals.get(entity.id, 1000)  # unknown -> large, never below a threshold
         if limit == 0:
-            return SimpleNamespace(total=self.full_totals[entity.id])
+            return SimpleNamespace(total=total)
         if getattr(entity, "broadcast", False) and not (entity.creator or entity.admin_rights):
             raise errors.ChatAdminRequiredError(None)
-        return SimpleNamespace(total=self.full_totals[entity.id])
+        return SimpleNamespace(total=total)
 
 
 RESULTS = []
@@ -108,9 +109,10 @@ case("baseline: active / read_only / paid classified", (s["active"], s["read_onl
 s = status([megagroup(4)], participants={4: banned(restrict(EPOCH))})
 case("baseline: forever-muted (until_date=0 -> epoch) counted restricted", s["restricted"] == 1, str(s))
 
-t, c = scan([legacy(5, count=12), megagroup(6, participants_count=60), megagroup(7, participants_count=10)])
-case("baseline: under-50 uses entity count (legacy 12 flagged, 60 not, 10 flagged)",
-     set(c) == {-5, -1000000000007} and c[-5]["member_count"] == 12, str({k: v["reason"] for k, v in c.items()}))
+t, c = scan([broadcast(5, participants_count=12), broadcast(6, participants_count=60), broadcast(7, participants_count=10)])
+case("baseline: under-50 (view-only channels only) uses entity count (12 flagged, 60 not, 10 flagged)",
+     set(c) == {-1000000000005, -1000000000007} and c[-1000000000005]["member_count"] == 12,
+     str({k: v["reason"] for k, v in c.items()}))
 
 # ---------- C1: unreadable group must not silently vanish from the buckets ----------
 s = status([megagroup(11), megagroup(12)], participants={12: errors.ChannelPrivateError(None)})
@@ -156,10 +158,10 @@ case("C7 scan: permanent mute has no muted_until", c.get(-1000000000063, {}).get
 
 # ---------- C8: leave-time re-verification ----------
 if hasattr(lg, "leave_confirmed_groups"):
-    ent = megagroup(71, participants_count=80)
+    ent = broadcast(71, participants_count=80)
     fc = FakeClient([ent])
     res, aborted = lg.leave_confirmed_groups(fc, [{"peer_id": str(utils.get_peer_id(ent)), "title": "x", "reason": "under_50_members"}])
-    case("C8 leave: group that grew past the threshold since the scan is NOT left",
+    case("C8 leave: view-only channel that grew past the threshold since the scan is NOT left",
          res and res[0]["status"] == "skipped", str(res))
 
 
@@ -179,10 +181,10 @@ fc = FloodOnce([megagroup(83)], participants={83: banned(restrict(EPOCH))})
 s = lg.scan_account_status(fc)
 case("C10 status: short FloodWait is retried (group not lost) -> restricted=1", s["restricted"] == 1 and s["unchecked"] == 0, str(s))
 
-ent = megagroup(91, participants_count=20)
+ent = broadcast(91, participants_count=20)
 fc = FakeClient([ent])
 res, ab = lg.leave_confirmed_groups(fc, [{"peer_id": str(utils.get_peer_id(ent)), "title": "x", "reason": "under_50_members"}])
-case("C11 leave: group that STILL qualifies is left", res[0]["status"] == "left" and getattr(fc, "left", None) == [91], str(res))
+case("C11 leave: view-only channel under the threshold STILL qualifies -> left", res[0]["status"] == "left" and getattr(fc, "left", None) == [91], str(res))
 
 ent = megagroup(92, admin_rights=T.ChatAdminRights(), participants_count=5)
 fc = FakeClient([ent])
@@ -192,6 +194,140 @@ case("C11 leave: account became ADMIN since scan -> skipped, not left", res[0]["
 fc = FakeClient([megagroup(93)], participants={93: errors.ChannelPrivateError(None)})
 res, ab = lg.leave_confirmed_groups(fc, [{"peer_id": str(utils.get_peer_id(fc.dialogs[0].entity)), "title": "x", "reason": "muted"}])
 case("C11 leave: can't verify -> skipped, never left on a guess", res[0]["status"] == "skipped" and not getattr(fc, "left", None), str(res))
+
+# =====================================================================
+# 2026-10-17 audit. Owner's rule: "active" = the account can SEND messages.
+#   NOT active: muted, read-only, paid messages (and view-only channels).
+#   An active group must never be a leave candidate, whatever its size.
+# =====================================================================
+import contextlib, io, itertools
+
+def pid(e): return utils.get_peer_id(e)
+
+# How Telegram's own software writes a text restriction: `send_plain`, with the legacy
+# `send_messages` left False (tdlib DialogParticipant.cpp get_chat_banned_rights();
+# Android ChatRightsEditActivity: the "Send messages" toggle flips send_plain).
+def plain_only(until=EPOCH, view=False):
+    return T.ChatBannedRights(until_date=until, send_plain=True, view_messages=view)
+READ_ONLY_PLAIN = plain_only()
+BOT_MUTE = T.ChatBannedRights(  # what a Bot-API (TDLib-based) moderator bot writes for a full mute
+    until_date=EPOCH, send_plain=True, send_photos=True, send_videos=True, send_roundvideos=True,
+    send_audios=True, send_voices=True, send_docs=True, send_stickers=True, send_gifs=True,
+    send_games=True, send_inline=True, embed_links=True, send_polls=True)
+
+# ---------- S: send_plain restrictions are real restrictions ----------
+s = status([megagroup(101)], participants={101: banned(plain_only())})
+case("S1 status: member muted via send_plain (what Telegram clients write) -> restricted, not active",
+     s["restricted"] == 1 and s["active"] == 0, str(s))
+s = status([megagroup(102)], participants={102: banned(BOT_MUTE)})
+case("S2 status: moderator-bot style full mute (send_plain + media flags) -> restricted", s["restricted"] == 1, str(s))
+s = status([megagroup(103, default_banned_rights=READ_ONLY_PLAIN)])
+case("S3 status: group made read-only via send_plain -> read_only, not active", s["read_only"] == 1 and s["active"] == 0, str(s))
+e = megagroup(104)
+t, c = scan([e], participants={104: banned(plain_only())})
+case("S4 scan: send_plain mute is flagged as muted", c.get(pid(e), {}).get("reason") == "muted", str(c))
+s = status([megagroup(105)], participants={105: banned(plain_only(view=True))})
+case("S5 status: send_plain + view_messages = kicked/banned -> unchecked (not 'restricted')",
+     s["unchecked"] == 1 and s["restricted"] == 0, str(s))
+s = status([megagroup(106, admin_rights=T.ChatAdminRights(), default_banned_rights=READ_ONLY_PLAIN)])
+case("S6 status: admin in a send_plain read-only group -> active", s["active"] == 1 and s["read_only"] == 0, str(s))
+s = status([megagroup(107)], participants={107: banned(T.ChatBannedRights(until_date=EPOCH, send_stickers=True, embed_links=True))})
+case("S7 status: only stickers/links restricted, text allowed -> still active (can send messages)", s["active"] == 1, str(s))
+e = megagroup(108)
+t, c = scan([e], participants={108: banned(plain_only(until=NOW + timedelta(days=2)))})
+case("S8 scan: temporary send_plain mute -> muted WITH muted_until", c.get(pid(e), {}).get("muted_until"), str(c))
+s = status([megagroup(109)], participants={109: banned(plain_only(until=NOW - timedelta(days=1)))})
+case("S8 status: EXPIRED send_plain restriction -> active", s["active"] == 1 and s["restricted"] == 0, str(s))
+e = megagroup(110)
+fc = FakeClient([e], participants={110: banned(plain_only())})
+res, ab = lg.leave_confirmed_groups(fc, [{"peer_id": str(pid(e)), "title": "x", "reason": "muted"}])
+case("S9 leave: send_plain-muted group still qualifies at leave time -> left", res[0]["status"] == "left", str(res))
+
+# ---------- A: active groups are never leave candidates ----------
+t, c = scan([legacy(111, count=12), megagroup(112, participants_count=60), megagroup(113, participants_count=10)])
+case("A1 scan: SMALL but active groups (12 / 60 / 10 members) are NOT leave candidates", c == {},
+     str({k: v["reason"] for k, v in c.items()}))
+e1, e2 = broadcast(114, participants_count=10), broadcast(115, participants_count=500)
+t, c = scan([e1, e2])
+case("A2 scan: view-only channel (not active) under the threshold is still flagged; big one is not",
+     set(c) == {pid(e1)}, str({k: v["reason"] for k, v in c.items()}))
+e = megagroup(116, participants_count=20)
+fc = FakeClient([e])
+res, ab = lg.leave_confirmed_groups(fc, [{"peer_id": str(pid(e)), "title": "x", "reason": "under_50_members"}])
+case("A3 leave: stale/forged 'under_50' candidate that is ACTIVE is skipped, never left",
+     res[0]["status"] == "skipped" and not getattr(fc, "left", None), str(res))
+
+def fuzz():
+    def make(kind, i, n, stars, dflt, adm):
+        kw = dict(adm)
+        if dflt is not None: kw["default_banned_rights"] = dflt
+        if kind == "legacy": return legacy(i, count=n, **kw)
+        if stars: kw["send_paid_messages_stars"] = stars
+        kw["participants_count"] = n
+        if kind == "mega": return megagroup(i, **kw)
+        if kind == "bcast": return broadcast(i, **kw)
+        return T.Channel(id=i, title=f"gg{i}", photo=PHOTO, date=NOW, gigagroup=True, **kw)
+    adms = [{}, {"creator": True}, {"admin_rights": T.ChatAdminRights()}]
+    parts = [None, banned(restrict(EPOCH)), banned(plain_only()), banned(BOT_MUTE), banned(plain_only(view=True)),
+             T.ChannelParticipantLeft(peer=T.PeerUser(ME)), errors.ChannelPrivateError(None),
+             T.ChannelParticipantAdmin(user_id=ME, promoted_by=1, date=NOW, admin_rights=T.ChatAdminRights())]
+    n_cases, problems, i = 0, [], 1000
+    for kind, dflt, adm, stars, n, p in itertools.product(
+            ["mega", "bcast", "legacy", "giga"], [None, READ_ONLY, READ_ONLY_PLAIN], adms, [None, 5], [5, 500], parts):
+        if kind == "legacy" and (stars or p is not None):
+            continue  # legacy chats have no stars and no per-member restrictions
+        i += 1
+        ent = make(kind, i, n, stars, dflt, adm)
+        pm = {i: p} if p is not None else {}
+        label = f"{kind} dflt={'-' if dflt is None else 'x'} adm={list(adm)} stars={stars} n={n} part={type(p).__name__}"
+        with contextlib.redirect_stdout(io.StringIO()):
+            st = lg.scan_account_status(FakeClient([ent], participants=pm))
+            _, cands = lg.scan_leave_candidates(FakeClient([ent], participants=pm, full_totals={i: n}))
+            fc = FakeClient([ent], participants=pm, full_totals={i: n})
+            lg.leave_confirmed_groups(fc, [{"peer_id": str(pid(ent)), "title": "x", "reason": "under_50_members"}])
+        n_cases += 1
+        if st["total"] != buckets_sum(st): problems.append("sum!=total " + label)
+        if st["active"] == 1 and cands: problems.append("ACTIVE group offered for leaving: " + label)
+        if st["active"] == 1 and getattr(fc, "left", None): problems.append("ACTIVE group was LEFT: " + label)
+    return n_cases, problems
+n_cases, problems = fuzz()
+case(f"A4 invariant over {n_cases} generated situations: active is never offered/left, total == sum(buckets)",
+     not problems, f"{len(problems)} problems; first: {problems[:3]}")
+
+# ---------- F: a failed run must not report fake zeros as a result ----------
+def run_main_failing(mode):
+    sent, saved = [], (lg.MODE, lg.make_client, lg.report)
+    def boom(account): raise RuntimeError("missing_secrets:CH_TG_API_ID")
+    lg.MODE, lg.make_client, lg.report = mode, boom, (lambda p: sent.append(p) or True)
+    code = None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            lg.main()
+    except SystemExit as ex:
+        code = ex.code
+    finally:
+        lg.MODE, lg.make_client, lg.report = saved
+    return code, sent
+for mode in ("status", "scan"):
+    code, sent = run_main_failing(mode)
+    p = sent[0] if sent else {}
+    case(f"F1 {mode}: failure exits 1 and reports an explicit error, no fake zero counts",
+         code == 1 and "error" in p and "total" not in p and "total_dialogs" not in p and "candidates" not in p, str(p))
+
+# ---------- G: refuse to run on a Telethon that lacks the fields the classifier needs ----------
+class OldChannel:  # stands in for a Telethon whose TL schema predates paid messages
+    def __init__(self, id, default_banned_rights=None, gigagroup=False): pass
+try:
+    lg._require_tl_fields(channel_cls=OldChannel); raised = False
+except RuntimeError as ex:
+    raised = "send_paid_messages_stars" in str(ex)
+case("G1 outdated Telethon (no send_paid_messages_stars) -> loud failure, not silent 'active'", raised)
+try:
+    lg._require_tl_fields(); ok_now = True
+except Exception as ex:
+    ok_now = False
+case("G2 installed Telethon passes the field check", ok_now)
+
 
 bad = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} passed")
