@@ -2,7 +2,7 @@
 Phase 4: Telethon join logic, invoked by .github/workflows/join.yml
 
 Env vars (required):
-  ACCOUNT                  - CH / JL / HHNC / NAWTHON; picks which account's secrets
+  ACCOUNT                  - CH / JL / HHNC / NAWTHON / NKST_NADI; picks which account's secrets
                              tg_accounts.py loads (see ACCOUNT_SECRETS there)
   GROUP_URL, QUEUE_ID      - passed from workflow_dispatch inputs
 
@@ -43,7 +43,7 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 
 GROUP_URL = os.environ["GROUP_URL"]
 QUEUE_ID = os.environ["QUEUE_ID"]
-# Which Telethon account this run uses (CH / JL / HHNC / NAWTHON). join.yml
+# Which Telethon account this run uses (CH / JL / HHNC / NAWTHON / NKST_NADI). join.yml
 # passes every account's secrets in; tg_accounts.load_credentials(ACCOUNT)
 # picks this account's set and fails loudly if any is missing.
 ACCOUNT = os.environ.get("ACCOUNT", "CH")

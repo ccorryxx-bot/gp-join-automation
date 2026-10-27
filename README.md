@@ -30,6 +30,7 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 11 - `/account_status` command — per-account group-count snapshot (2026-09-28) — see below
 - [x] Phase 12 - "Extract muted group urls" button on the scan-result message (2026-09-28) — see below
 - [x] Phase 13 - `/leavescan` "Scan Both" option (2026-09-28) — see below
+- [x] Phase 17 - add account `NKST_NADI` (5 accounts total) + `tests/test_accounts_wiring.py` drift guard (2026-10-28) — **code done; its 3 GitHub secrets are added manually by the owner**
 
 ## Bulk-URL intake (added 2026-09-22)
 
@@ -59,9 +60,11 @@ A bare single URL (no brackets) still works as before. Behavior:
 
 **Not yet live-tested** — needs a real multi-URL message sent to the bot once deployed, watching `join_queue` to confirm rows go `queued → triggered → joined/failed` one at a time with the expected gap between them.
 
-## Multi-account (CH / JL / HHNC / NAWTHON) + admin gating (added 2026-09-22, Phase 7)
+## Multi-account (CH / JL / HHNC / NAWTHON / NKST_NADI) + admin gating (added 2026-09-22, Phase 7)
 
 > **2026-10-15:** HHNC and NAWTHON added as accounts 3 and 4. Everything below written about "CH / JL" applies to all four; account pickers show 2 buttons per row plus a full-width "All" button (callback value still `BOTH`, now meaning every account).
+
+> **2026-10-28:** `NKST_NADI` added as account 5 (Phase 17). Everything above applies to all five. Until its three secrets exist in GitHub, picking it (or "All") fails closed with `missing_secrets:NKST_NADI_...` — it never falls back to another account's credentials.
 
 **Second Telethon account.** A dedicated account "JL" joins the "CH" naming
 convention above (see Secrets). Its credentials live as GitHub Actions
@@ -301,10 +304,15 @@ Telegram-account-specific secrets are prefixed per account — `CH_` for the fir
 | `NAWTHON_API_ID` | join.yml, leave.yml | from my.telegram.org, dedicated "NAWTHON" account (added 2026-10-15, **added manually**) |
 | `NAWTHON_API_HASH` | join.yml, leave.yml | from my.telegram.org, dedicated "NAWTHON" account — **added manually** |
 | `NAWTHON_TG_SESSION` | join.yml, leave.yml | Telethon StringSession, dedicated "NAWTHON" account — **added manually**, never commit |
+| `NKST_NADI_API_ID` | join.yml, leave.yml | from my.telegram.org, dedicated "NKST_NADI" account (added 2026-10-28, **added manually**) |
+| `NKST_NADI_API_HASH` | join.yml, leave.yml | from my.telegram.org, dedicated "NKST_NADI" account — **added manually** |
+| `NKST_NADI_STRING_SESSION` | join.yml, leave.yml | Telethon StringSession, dedicated "NKST_NADI" account — **added manually**, never commit (note the name: `..._STRING_SESSION`, not `..._TG_SESSION`) |
 | `WORKER_REPORT_URL` | join.yml | `https://gp-join-automation.ccorryxx.workers.dev` |
 | `REPORT_SECRET` | join.yml | must match Cloudflare's `REPORT_SECRET` exactly |
 
 > **Account → secret routing (2026-10-15).** `join.yml` and `leave.yml` pass **every** account's secrets in as env vars; `scripts/tg_accounts.py` (`ACCOUNT_SECRETS`) picks the set matching the `account` input and builds the Telethon client. A missing/empty/non-numeric secret is a hard, named failure (`missing_secrets:HHNC_API_ID,...`) that is reported back through `/report` like any other join failure — it does **not** fall back to another account's credentials (the old `a && b || c` workflow ternary would have, silently). Secret names per account are not uniform (CH/JL keep the names they were created with), which is why the mapping is an explicit table in `tg_accounts.py` rather than a naming rule.
+
+> **Adding an account = 4 places:** `scripts/tg_accounts.py` (`ACCOUNT_SECRETS`), `src/worker.js` (`ACCOUNTS`), and in both `join.yml` and `leave.yml` the `account` choice list + the 3 `env:` secret lines. Then run `python3 tests/test_accounts_wiring.py` — it fails if any of the four is out of sync (no telethon/network needed). Account names must not contain `:`.
 
 ### Adding another Telethon account
 1. Add its 3 GitHub secrets (API id / API hash / StringSession).

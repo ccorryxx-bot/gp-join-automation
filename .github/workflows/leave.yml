@@ -11,6 +11,7 @@ on:
           - JL
           - HHNC
           - NAWTHON
+          - NKST_NADI
         default: CH
       mode:
         description: "scan (read-only check), leave (actually leave confirmed groups), or status (read-only group-count snapshot for /account_status)"
@@ -71,6 +72,9 @@ jobs:
           NAWTHON_API_ID: ${{ secrets.NAWTHON_API_ID }}
           NAWTHON_API_HASH: ${{ secrets.NAWTHON_API_HASH }}
           NAWTHON_TG_SESSION: ${{ secrets.NAWTHON_TG_SESSION }}
+          NKST_NADI_API_ID: ${{ secrets.NKST_NADI_API_ID }}
+          NKST_NADI_API_HASH: ${{ secrets.NKST_NADI_API_HASH }}
+          NKST_NADI_STRING_SESSION: ${{ secrets.NKST_NADI_STRING_SESSION }}
           ACCOUNT: ${{ inputs.account }}
           MODE: ${{ inputs.mode }}
           SCAN_ID: ${{ inputs.scan_id }}

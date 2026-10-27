@@ -3,7 +3,7 @@ Account -> credentials routing shared by join_telegram.py and leave_groups.py.
 
 Why this lives in Python and not in a workflow `a && b || c` ternary:
 GitHub Actions expressions fall through to the next `||` branch when a secret
-is missing/empty. With 4 accounts that means a forgotten HHNC/NAWTHON secret
+is missing/empty. With 5 accounts that means a forgotten HHNC/NAWTHON/NKST_NADI secret
 would silently run with CH's credentials -- joining groups as the WRONG
 account. Here a missing secret is a hard, named failure instead.
 
@@ -23,11 +23,14 @@ from telethon.sessions import StringSession
 # account -> (API_ID secret, API_HASH secret, SESSION secret).
 # CH and JL keep the names they were created with (already live); HHNC and
 # NAWTHON follow <ACCOUNT>_API_ID / <ACCOUNT>_API_HASH / <ACCOUNT>_TG_SESSION.
+# NKST_NADI (2026-10-28) uses the names the owner created: ..._API_ID /
+# ..._API_HASH / ..._STRING_SESSION (note: STRING_SESSION, not TG_SESSION).
 ACCOUNT_SECRETS = {
     "CH": ("CH_TG_API_ID", "CH_TG_API_HASH", "CH_TG_SESSION_STRING"),
     "JL": ("JL_API_ID", "JL_API_HASH", "JL_STRING_SESSION"),
     "HHNC": ("HHNC_API_ID", "HHNC_API_HASH", "HHNC_TG_SESSION"),
     "NAWTHON": ("NAWTHON_API_ID", "NAWTHON_API_HASH", "NAWTHON_TG_SESSION"),
+    "NKST_NADI": ("NKST_NADI_API_ID", "NKST_NADI_API_HASH", "NKST_NADI_STRING_SESSION"),
 }
 
 

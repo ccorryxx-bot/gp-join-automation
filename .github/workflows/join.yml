@@ -17,6 +17,7 @@ on:
           - JL
           - HHNC
           - NAWTHON
+          - NKST_NADI
         default: CH
 
 # Defense-in-depth alongside the Worker's own in-flight check
@@ -28,7 +29,7 @@ on:
 # already going.
 #
 # Phase 7 (2026-09-22): per-account group, as this comment originally
-# predicted -- every account (CH / JL / HHNC / NAWTHON) gets its own lane, so
+# predicted -- every account (CH / JL / HHNC / NAWTHON / NKST_NADI) gets its own lane, so
 # a run for one account is queued behind that SAME account's in-progress run,
 # but never blocks the other accounts from joining in parallel.
 concurrency:
@@ -73,6 +74,9 @@ jobs:
           NAWTHON_API_ID: ${{ secrets.NAWTHON_API_ID }}
           NAWTHON_API_HASH: ${{ secrets.NAWTHON_API_HASH }}
           NAWTHON_TG_SESSION: ${{ secrets.NAWTHON_TG_SESSION }}
+          NKST_NADI_API_ID: ${{ secrets.NKST_NADI_API_ID }}
+          NKST_NADI_API_HASH: ${{ secrets.NKST_NADI_API_HASH }}
+          NKST_NADI_STRING_SESSION: ${{ secrets.NKST_NADI_STRING_SESSION }}
           ACCOUNT: ${{ inputs.account }}
           GROUP_URL: ${{ inputs.group_url }}
           QUEUE_ID: ${{ inputs.queue_id }}

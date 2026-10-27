@@ -21,7 +21,9 @@ const REPORT_STATUSES = new Set(["joined", "already_member", "pending_approval",
 // another Telethon account — everything else in this file (dedup, dispatch,
 // pacing) is already generic over this list.
 // 2026-10-15: HHNC + NAWTHON added (4 accounts total).
-const ACCOUNTS = ["CH", "JL", "HHNC", "NAWTHON"];
+// 2026-10-28: NKST_NADI added (5 accounts total). Underscore in the name is safe:
+// callback_data is split on ":" only, and KV keys use ":" as their separator.
+const ACCOUNTS = ["CH", "JL", "HHNC", "NAWTHON", "NKST_NADI"];
 
 // Inline-keyboard rows for an account picker: 2 accounts per row (4 buttons
 // in one row gets clipped on phones), then an optional full-width "All" row.
@@ -1341,7 +1343,7 @@ const HELP_TEXT = [
   "Group link ပို့ပါ — line တစ်ကြောင်းကို link တစ်ခုစီ (numbered list ဖြစ်နိုင်တယ်):",
   "1. https://t.me/+xxxxxxxxxxxx",
   "2. https://t.me/+yyyyyyyyyyyy",
-  "URL ဘေးနားမှာ extra စာသား မကပ်ပါစေနဲ့ — ဘယ် account (CH / JL / HHNC / NAWTHON) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
+  "URL ဘေးနားမှာ extra စာသား မကပ်ပါစေနဲ့ — ဘယ် account (CH / JL / HHNC / NAWTHON / NKST_NADI) နဲ့ join မလဲ ခလုတ်တွေ ပြပေးပါမယ်။",
   "",
   ...BOT_COMMANDS.map((c) => `/${c.command} — ${c.description}`),
 ].join("\n");
