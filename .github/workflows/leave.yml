@@ -14,13 +14,14 @@ on:
           - NKST_NADI
         default: CH
       mode:
-        description: "scan (read-only check), leave (actually leave confirmed groups), or status (read-only group-count snapshot for /account_status)"
+        description: "scan (read-only check), leave (actually leave confirmed groups), status (read-only group-count snapshot for /account_status), or list (read-only active group ID list for /listgroups_py)"
         required: true
         type: choice
         options:
           - scan
           - leave
           - status
+          - list
         default: scan
       scan_id:
         description: "leave_scans.id this run belongs to (set by the Worker)"
@@ -63,7 +64,7 @@ jobs:
 
       - run: pip install telethon
 
-      - name: Scan or leave muted groups
+      - name: Scan, leave, status or list groups
         env:
           # Every account's secrets are passed in; scripts/tg_accounts.py picks the
           # set matching ACCOUNT and fails loudly if any is missing (a workflow

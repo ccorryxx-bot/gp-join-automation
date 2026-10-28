@@ -149,6 +149,22 @@ check("leave.yml passes SCOPE to the script", re.search(r"^\s+SCOPE: \$\{\{ inpu
 dispatched = set(re.findall(r'dispatchLeaveWorkflow\(env, account, "leave", scanId, [^?]*\? "(\w+)" : "(\w+)"\)', read("src/worker.js"))[0]) if re.search(r'dispatchLeaveWorkflow\(env, account, "leave"', read("src/worker.js")) else set()
 check("every scope value the Worker can dispatch is a valid leave.yml option", dispatched and dispatched <= set(scope_options), f"{dispatched} vs {scope_options}")
 
+# --- Phase 19: every mode the Worker can dispatch must exist in leave.yml AND in the script -------------
+m = re.search(r"\n      mode:\n(?:        .*\n)*?        options:\n((?:          - .*\n)+)", leave_yml)
+mode_options = [l.strip()[2:].strip() for l in m.group(1).splitlines()] if m else []
+worker_modes = set(re.findall(r'dispatchLeaveWorkflow\(env, account, "(\w+)"', read("src/worker.js")))
+script_modes = set(re.findall(r'^\s+if MODE == "(\w+)":', read("scripts/leave_groups.py"), flags=re.M))
+check("leave.yml `mode` options include list", "list" in mode_options, str(mode_options))
+check("every mode the Worker dispatches is a leave.yml `mode` option", worker_modes and worker_modes <= set(mode_options), f"{worker_modes} vs {mode_options}")
+check("every leave.yml `mode` option is handled by leave_groups.py main()", set(mode_options) <= script_modes, f"{mode_options} vs {script_modes}")
+check("every mode the Worker dispatches is handled by leave_groups.py main()", worker_modes <= script_modes, f"{worker_modes} vs {script_modes}")
+check("Worker handles a /leave-report for every mode the script can send",
+      all(f'mode === "{x}"' in read("src/worker.js") for x in script_modes), str(script_modes))
+check("/listgroups_py is in BOT_COMMANDS (so /help and the / menu show it)",
+      re.search(r'\{ command: "listgroups_py"', read("src/worker.js")) is not None)
+check("picker callback_data for /listgroups_py fits Telegram's 64-byte limit",
+      max(len(f"listgroups:{a}".encode()) for a in accounts) <= 64)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED")

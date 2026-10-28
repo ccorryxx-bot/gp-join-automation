@@ -8,7 +8,7 @@ account -- see README "Verification" for the live-check step.
 
 Run:  python tests/test_leave_logic.py
 """
-import os, sys
+import json, os, sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -489,6 +489,79 @@ try:
 except Exception as ex:
     ok_now = False
 case("G2 installed Telethon passes the field check", ok_now)
+
+
+# ---------- L: Phase 19 -- MODE=list (/listgroups_py) ----------
+def lst(entities, **kw):
+    return lg.scan_active_group_ids(FakeClient(entities, **kw))
+
+def list_sum(r):
+    return (r["active"] + r["restricted"] + r["paid_messages"] + r["read_only"] + r["broadcast"]
+            + r["unchecked"] + sum(r["excluded"].values()))
+
+r = lst([megagroup(301), megagroup(302, default_banned_rights=READ_ONLY), megagroup(303, send_paid_messages_stars=5),
+         broadcast(304, participants_count=100), megagroup(305), legacy(306), legacy(307, default_banned_rights=READ_ONLY)],
+        participants={305: banned(restrict(EPOCH))})
+case("L1 only groups the account can send in are listed (read-only / paid / view-only channel / muted are not)",
+     r["group_ids"] == [-1000000000301, -306] and (r["active"], r["read_only"], r["paid_messages"], r["broadcast"], r["restricted"]) == (2, 2, 1, 1, 1),
+     str(r))
+case("L1b ids are Telegram peer ids in the -100... form (legacy chats: -<id>), plain ints", all(isinstance(i, int) for i in r["group_ids"]) and r["group_ids"][0] == utils.get_peer_id(megagroup(301)), str(r["group_ids"]))
+
+# the three rules of the owner's list_groups.py that the shared classifier does not apply
+st = status([broadcast(311, creator=True)])
+r = lst([broadcast(311, creator=True), megagroup(312, creator=True)])
+case("L2 admin-owned broadcast CHANNEL is not a group: excluded from the list, although /account_status still counts it active",
+     r["group_ids"] == [-1000000000312] and r["excluded"]["channel"] == 1 and st["active"] == 1, f"{r} status={st}")
+r = lst([megagroup(313, monoforum=True)])
+case("L3 monoforum (channel direct-messages inbox) is excluded", r["group_ids"] == [] and r["excluded"]["monoforum"] == 1, str(r))
+SUB = NOW + timedelta(days=5)
+r = lst([megagroup(314, subscription_until_date=SUB), megagroup(315)])
+case("L4 Stars-subscription group is excluded (EXCLUDE_PAID_SUB on by default)", r["group_ids"] == [-1000000000315] and r["excluded"]["paid_subscription"] == 1, str(r))
+lg.EXCLUDE_PAID_SUB = False
+r = lst([megagroup(314, subscription_until_date=SUB)])
+lg.EXCLUDE_PAID_SUB = True
+case("L4b EXCLUDE_PAID_SUB=0 keeps subscription groups", r["group_ids"] == [-1000000000314] and r["excluded"]["paid_subscription"] == 0, str(r))
+
+# honesty about groups we could not judge, and the invariant
+r = lst([megagroup(321), megagroup(322), broadcast(323, creator=True), megagroup(324, monoforum=True), megagroup(325, default_banned_rights=READ_ONLY)],
+        participants={322: errors.ChannelPrivateError(None)})
+case("L5 a group Telegram won't let us read is counted unchecked and NEVER listed as active",
+     r["unchecked"] == 1 and -1000000000322 not in r["group_ids"] and r["group_ids"] == [-1000000000321], str(r))
+case("L6 total == active + every other bucket + excluded (nothing vanishes)", r["total"] == list_sum(r) == 5, f"total={r['total']} sum={list_sum(r)}")
+
+# same group delivered twice (archive + main folder) is listed and counted once
+e = megagroup(331)
+fc = FakeClient([e]); fc.dialogs = fc.dialogs * 2
+r = lg.scan_active_group_ids(fc)
+case("L7 a dialog returned twice is listed and counted once", r["group_ids"] == [-1000000000331] and r["total"] == 1, str(r))
+
+# time budget: a partial list must never look complete
+ticks = iter(range(0, 1000, 10))
+try:
+    lg.scan_active_group_ids(FakeClient([megagroup(341), megagroup(342)]), budget_seconds=5, clock=lambda: next(ticks)); raised = False
+except RuntimeError as ex:
+    raised = str(ex).startswith("time_budget_exceeded")
+case("L8 out of time -> RuntimeError (reported as an error), not a partial list", raised)
+
+# pacing: only after a group that cost a real API call (admin groups cost none)
+_orig_sleep, slept = time.sleep, []
+time.sleep = lambda s_: slept.append(s_)
+lg.scan_active_group_ids(FakeClient([megagroup(351, creator=True), legacy(352)])); no_api = len(slept)
+slept.clear()
+lg.scan_active_group_ids(FakeClient([megagroup(353), megagroup(354)])); with_api = len(slept)
+time.sleep = _orig_sleep
+case("L9 list: no pacing sleep for admin/legacy groups, one per group that cost a call", (no_api, with_api) == (0, 2), f"{no_api}, {with_api}")
+
+# main(): the report the Worker receives
+code, sent, made = run_main("list", CM([megagroup(361), broadcast(362, participants_count=9)]))
+p_ = sent[0] if sent else {}
+case("L10 list main: one report, mode=list, ids + breakdown, JSON-serializable, exit 0",
+     code is None and len(sent) == 1 and p_.get("mode") == "list" and p_.get("group_ids") == [-1000000000361]
+     and p_.get("total") == 2 and p_.get("broadcast") == 1 and "error" not in p_ and json.loads(json.dumps(p_)) == p_, str(sent))
+code, sent = run_main_failing("list")
+p_ = sent[0] if sent else {}
+case("L11 list failure: exits 1 and reports an explicit error -- no group_ids, no fake empty list",
+     code == 1 and "error" in p_ and "group_ids" not in p_ and "total" not in p_, str(p_))
 
 
 bad = [n for n, ok, _ in RESULTS if not ok]

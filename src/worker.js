@@ -398,6 +398,35 @@ async function triggerAccountStatus(env, account) {
   return "dispatch_failed";
 }
 
+// Phase 19 (2026-10-29): /listgroups_py -- the account's ACTIVE group IDs (groups it can
+// send messages in) as a .txt file. Same shape as /account_status: leave.yml with
+// mode="list", no leave_scans row, and its own short-lived KV guard so a double-tap gets a
+// friendly reply. It does NOT set leave:running -- like status it only reads, and the
+// leave.yml concurrency group (shared with join.yml, per account) already guarantees it
+// never overlaps a join or leave run on the same session. TTL is the whole job cap
+// (leave.yml timeout-minutes) because a big account legitimately takes ~10 min: one
+// GetParticipant call per non-admin channel, paced 1-2 s each.
+const LIST_RUNNING_TTL_SECONDS = 20 * 60;
+
+function listRunningKvKey(account) {
+  return `listgroups:running:${account}`;
+}
+
+async function triggerListGroups(env, account) {
+  if (await env.DEDUP_KV.get(listRunningKvKey(account))) {
+    return "running";
+  }
+  await env.DEDUP_KV.put(listRunningKvKey(account), "1", {
+    expirationTtl: LIST_RUNNING_TTL_SECONDS,
+  });
+
+  const ok = await dispatchLeaveWorkflow(env, account, "list", 0);
+  if (ok) return "started";
+
+  await env.DEDUP_KV.delete(listRunningKvKey(account));
+  return "dispatch_failed";
+}
+
 // Kept separate from dispatchNextQueuedJoinForAccount's inline fetch call
 // rather than unified into one shared helper — that function is already
 // live/tested in production; not touching it for a DRY-only change.
@@ -597,7 +626,46 @@ async function handleLeaveReport(request, env) {
   // Whichever phase just finished, the session is free again — clear the
   // pause before doing anything else so a slow D1/Telegram call below never
   // extends the join-pause past what actually happened on GitHub's side.
-  await env.DEDUP_KV.delete(leaveRunningKvKey(account));
+  // (A list run never holds the leave/scan flag, so it must not clear it either: a
+  // /leavescan queued behind this run would otherwise lose its join-pause early.)
+  if (mode !== "list") {
+    await env.DEDUP_KV.delete(leaveRunningKvKey(account));
+  }
+
+  if (mode === "list") {
+    await env.DEDUP_KV.delete(listRunningKvKey(account));
+
+    // Same rule as status/scan: a failed run is an explicit failure, never an empty
+    // "[]" file or "0 active groups" presented as the answer.
+    if (body.error) {
+      await notifyAdmin(
+        env,
+        `❌ [${account}] Group ID list မအောင်မြင်ပါ — ${String(body.error).slice(0, 200)}\n\n` +
+          `List မပို့ပါဘူး (မပြည့်စုံတဲ့ list ကို အပြည့်အစုံလို့ မထင်မိစေချင်လို့ပါ)။ GitHub Actions log ကြည့်ပြီး ပြန် run ပါ။`
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    const ids = Array.isArray(body.group_ids) ? body.group_ids.map(String) : null;
+    if (!ids || !ids.every((id) => /^-?\d+$/.test(id))) {
+      await notifyAdmin(env, `❌ [${account}] Group ID list — report format မမှန်ပါ (Worker နဲ့ script version မကိုက်ဘူး ဖြစ်နိုင်)`);
+      return new Response("bad request", { status: 400 });
+    }
+
+    const caption = buildListCaption(account, ids.length, body);
+    if (ids.length === 0) {
+      await notifyAdmin(env, `${caption}\n\nActive group မတွေ့ပါဘူး — .txt file မပို့ပါ`);
+      return new Response("OK", { status: 200 });
+    }
+
+    const delivered = await sendDocumentToAdmin(env, groupIdsFileName(account), buildGroupIdsFile(ids), caption);
+    if (!delivered) {
+      await notifyAdmin(env, `⚠️ [${account}] Active group ${ids.length} ခု ရပေမဲ့ .txt file ပို့လို့ မရပါ — ပြန် run ပါ`);
+      // Non-2xx on purpose: the run goes red instead of looking like the admin got the file.
+      return new Response("telegram send failed", { status: 502 });
+    }
+    return new Response("OK", { status: 200 });
+  }
 
   if (mode === "status") {
     // Own KV key (not leaveRunningKvKey) — a status run never pauses joins,
@@ -856,6 +924,63 @@ async function notifyAdmin(env, text, replyMarkup) {
   });
   if (!res.ok) {
     console.error("notifyAdmin failed:", res.status, await res.text());
+  }
+}
+
+// Phase 19: the .txt body for /listgroups_py, in the exact shape the owner asked for -- one
+// bracketed list, first id right after "[", every later id on its own line indented 4 spaces:
+//   [-1002471129333,
+//       -1003773390942,
+//       -1003789288457]
+// A file (not a message) because a few hundred ids blow past Telegram's 4096-char limit.
+function buildGroupIdsFile(ids) {
+  return `[${ids.join(",\n    ")}]`;
+}
+
+// e.g. CH -> CH_groupsids.txt, NKST_NADI -> NKST_NADI_groupsids.txt
+function groupIdsFileName(account) {
+  return `${account}_groupsids.txt`;
+}
+
+// Caption for the .txt (Telegram caps captions at 1024 chars; this stays well under).
+function buildListCaption(account, activeCount, b) {
+  const n = (v) => Number(v) || 0;
+  const ex = b.excluded && typeof b.excluded === "object" ? b.excluded : {};
+  const lines = [
+    `📋 [${account}] Active group IDs - ${activeCount}`,
+    `Total groups - ${n(b.total)}`,
+    `restricted ${n(b.restricted)} · read only ${n(b.read_only)} · paid message ${n(b.paid_messages)} · channels (view-only) ${n(b.broadcast)}`,
+  ];
+  if (n(ex.channel) + n(ex.paid_subscription) + n(ex.monoforum) > 0) {
+    lines.push(`ချန်ထားတာ — admin channel ${n(ex.channel)} · paid subscription ${n(ex.paid_subscription)} · monoforum ${n(ex.monoforum)}`);
+  }
+  if (n(b.unchecked) > 0) {
+    lines.push(`⚠️ unchecked ${n(b.unchecked)} — Telegram က မပြောလို့ list ထဲ မထည့်ထားပါ (ခဏနေ ပြန် run ကြည့်ပါ)`);
+  }
+  return lines.join("\n");
+}
+
+// notifyAdmin's file twin: multipart sendDocument to ADMIN_TG_ID. Returns true only if
+// Telegram accepted it, so the caller can fail loudly instead of assuming delivery.
+async function sendDocumentToAdmin(env, filename, content, caption) {
+  if (!env.ADMIN_TG_ID) return false;
+  const form = new FormData();
+  form.append("chat_id", String(env.ADMIN_TG_ID));
+  if (caption) form.append("caption", caption.slice(0, 1000));
+  form.append("document", new Blob([content], { type: "text/plain" }), filename);
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendDocument`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) {
+      console.error("sendDocumentToAdmin failed:", res.status, await res.text());
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("sendDocumentToAdmin threw:", err);
+    return false;
   }
 }
 
@@ -1215,6 +1340,38 @@ async function handleCallbackQuery(env, cq) {
     return;
   }
 
+  if (data.startsWith("listgroups:")) {
+    // "BOTH" = every account, one independent run (and one .txt) per account, exactly like
+    // acctstatus. Different accounts have different concurrency groups -> they run in
+    // parallel, each on its own session.
+    const choice = data.slice("listgroups:".length);
+    const accountsToRun = choice === "BOTH" ? ACCOUNTS : ACCOUNTS.includes(choice) ? [choice] : null;
+    if (!accountsToRun) {
+      await answerCallbackQuery(env, cq.id, "⚠️ မသိတဲ့ account");
+      return;
+    }
+
+    const RESULT_TEXT = {
+      running: (a) => `⏳ [${a}] Group ID list အရင်ကတည်းက run နေပါတယ်`,
+      started: (a) => `✅ [${a}] Group ID list စပါပြီ — ပြီးရင် .txt file ပို့ပေးပါမယ် (group များရင် ၁၀ မိနစ်လောက် ကြာနိုင်ပါတယ်)`,
+      dispatch_failed: (a) => `⚠️ [${a}] Dispatch မအောင်မြင်ပါ — ပြန်ခေါ်ကြည့်ပါ`,
+    };
+    const lines = [];
+    for (const acc of accountsToRun) {
+      const result = await triggerListGroups(env, acc);
+      lines.push(RESULT_TEXT[result](acc));
+    }
+
+    await answerCallbackQuery(env, cq.id);
+    const summary = lines.join("\n");
+    if (messageId) {
+      await editMessageText(env, chatId, messageId, summary);
+    } else {
+      await replyToUser(env, chatId, summary);
+    }
+    return;
+  }
+
   if (!data.startsWith("acct:")) {
     await answerCallbackQuery(env, cq.id);
     return;
@@ -1462,6 +1619,7 @@ const BOT_COMMANDS = [
   { command: "status", description: "Queue status (account တစ်ခုချင်းစီ)" },
   { command: "leavescan", description: "Muted group scan စတင်ရန် (account ရွေးရမယ်, admin ကိုယ်တိုင် ခေါ်မှ run)" },
   { command: "account_status", description: "Account status — Total/active/restricted/paid/read-only/channel group count (account ရွေးရမယ်)" },
+  { command: "listgroups_py", description: "Active group ID list (.txt file) — account တစ်ခုရွေး (သို့) All (account ရွေးရမယ်)" },
   { command: "sync_menu", description: "ဒီ Bot Menu ခလုတ်ကို command list အသစ်နဲ့ sync ပြန်ရန်" },
   { command: "help", description: "ဒီ usage message ပြန်ပြရန်" },
 ];
@@ -1490,6 +1648,10 @@ async function handleCommand(env, chatId, text) {
   }
   if (cmd === "/account_status") {
     await sendAccountStatusPrompt(env, chatId);
+    return;
+  }
+  if (cmd === "/listgroups_py") {
+    await sendListGroupsPrompt(env, chatId);
     return;
   }
   if (cmd === "/sync_menu") {
@@ -1793,6 +1955,25 @@ async function sendAccountStatusPrompt(env, chatId) {
   });
   if (!res.ok) {
     console.error("sendAccountStatusPrompt failed:", res.status, await res.text());
+  }
+}
+
+// /listgroups_py: same picker style as /account_status. One account, or "All" = every
+// account (each reports back with its own .txt, no merged file).
+async function sendListGroupsPrompt(env, chatId) {
+  const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: "📋 Active group ID list — ဘယ် Account ကို list ထုတ်မလဲ ရွေးပါ (သို့) All 👇",
+      reply_markup: {
+        inline_keyboard: accountPickerRows("List", "listgroups", "List All"),
+      },
+    }),
+  });
+  if (!res.ok) {
+    console.error("sendListGroupsPrompt failed:", res.status, await res.text());
   }
 }
 

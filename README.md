@@ -32,6 +32,7 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 13 - `/leavescan` "Scan Both" option (2026-09-28) — see below
 - [x] Phase 17 - add account `NKST_NADI` (5 accounts total) + `tests/test_accounts_wiring.py` drift guard (2026-10-28) — **code done; its 3 GitHub secrets are added manually by the owner**
 - [x] Phase 18 - leave scopes ("read-only + view-only + paid" button), Extract button for every account, leave-run safety fixes (2026-10-28) — see "Leave scopes" below
+- [x] Phase 19 - `/listgroups_py` — active group IDs as a `.txt` file, one account or All (2026-10-29) — see below
 
 ## Bulk-URL intake (added 2026-09-22)
 
@@ -264,6 +265,42 @@ the reply; the other still starts.
 - Members who **boosted** a group can be exempt from its default restrictions (`ChannelFull.boosts_unrestrict`; needs one extra API call per read-only group, not made). Boosting needs Premium, so unlikely for these accounts; such a group would show as `read_only`.
 - No migration needed: `leave_candidates.reason` / `status` are free TEXT (`not_selected` is a new status value, `view_only` a new reason).
 - Deploy order is safe either way: the Worker passes `scope` only on leave dispatches, and `leave.yml` defaults it to `all`.
+
+## `/listgroups_py` — active group IDs as a .txt file (added 2026-10-29, Phase 19)
+
+Admin-only, read-only. `/listgroups_py` shows the account picker (**one button per account, plus "List All"**). A tap dispatches `leave.yml` with `mode: list`; the run walks the account's groups and the Worker sends the admin a `.txt` file of every group the account **can send messages in**, e.g. `CH_groupsids.txt`:
+
+```
+[-1002471129333,
+    -1003773390942,
+    -1003900362963]
+```
+
+First id right after `[`, every later id on its own line indented 4 spaces, `]` after the last. A file (not a message) because a few hundred ids exceed Telegram's 4096-character message limit; the caption carries the counts. "List All" = one independent run **and one file per account** (no merged file). A run that fails, runs out of time, or finds 0 active groups sends an explicit notice — never a `[]` file or a partial list that looks complete.
+
+**Why it runs through `leave.yml` and not a new workflow:** same Telethon session, same credentials (`tg_accounts.py`) and the same per-account concurrency group as join/leave/status, so a list run can never overlap another run on the same session (no revoke risk). `/account_status` was added the same way (`mode: status`).
+
+**Two classifiers existed — which one is used, and why.** The owner's production `list_groups.py` and the repo's `evaluate()` (used by `/account_status` and `/leavescan`) disagreed on the same account. Compared by reading both:
+
+| | owner's `list_groups.py` | repo `evaluate()` |
+|---|---|---|
+| Per-user restriction | reads the dialog entity's `banned_rights` (no extra call) | asks Telegram per channel (`GetParticipant`) — authoritative, but one call per non-admin channel |
+| A group Telegram refuses to describe | no such case — decided from the entity alone | counted `unchecked`, **never** active |
+| Read-only group + per-user record that does not ban text | `read_only` | `unchecked` (could be an admin-granted exception) |
+| Admin-owned broadcast channel | not a group → not listed | admin ⇒ "active" |
+| Stars-subscription group | `paid` (`EXCLUDE_PAID_SUB`) | not looked at → "active" |
+| `monoforum` | skipped | not looked at |
+| Shared by status / scan / leave, offline-tested (76 cases) | no | yes — one implementation, mutation-checked |
+
+**Decision: `evaluate()` is the engine** (single tested implementation, fails closed, same numbers as `/account_status`), **plus three rules taken from `list_groups.py`**, applied only in list mode (`list_exclusion()`): admin-owned broadcast channels, monoforum inboxes and Stars-subscription groups are left out (`EXCLUDE_PAID_SUB=0` keeps subscription groups). `/account_status` and `/leavescan` are unchanged, so their "active" can legitimately be higher than the list by exactly those three kinds. The caption shows how many of each were left out and how many groups were `unchecked`, so any gap between two numbers can be explained rather than guessed.
+
+🟡 **Not verified live:** that these three rules are what made the two scripts disagree on the owner's accounts is a conclusion from the code, not from Telegram. First live check: run `/listgroups_py` and `/account_status` on the same account; `status.active − list.active` should equal admin channel + paid subscription + monoforum from the caption (±groups that changed in between). If it doesn't, the caption's `unchecked` count and the Actions log (`[list] {...}` line) say where the difference is.
+
+**Cost:** one Telegram call (paced 1–2 s) per non-admin channel/supergroup — estimated ~10 min for ~400 groups (1–2 s pacing). `LIST_TIME_BUDGET_SECONDS` (default 1020) stops the run before the 20-min job cap and reports an error. The `listgroups:running:{account}` KV guard (TTL 20 min) only prevents a double-tap; it does not set `leave:running`, and a list report does not clear it.
+
+**After deploy, run `/sync_menu` once** so `/listgroups_py` appears in Telegram's `/` menu (the command works without it).
+
+**Tests (offline):** `python3 tests/test_leave_logic.py` (L1–L11), `node --no-warnings tests/test_worker_list_groups.mjs` (file format byte-for-byte, failure/empty/malformed never yield a file, 502 on a refused upload, picker/dispatch/All/double-tap/non-admin), `python3 tests/test_accounts_wiring.py` (every dispatched mode exists in `leave.yml` and the script).
 
 ## Live Verification Log
 

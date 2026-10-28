@@ -47,6 +47,18 @@ Phase 8 (2026-09-23): "leave muted groups" automation, invoked by
                nothing to confirm or leave later) but still required/sent
                for a consistent report payload shape across modes.
 
+  MODE=list   - read-only. Phase 19 (2026-10-29), invoked by the admin's
+               /listgroups_py bot command. Walks the same dialogs with the SAME
+               classifier (evaluate()) and keeps only the groups where the
+               account can send messages ("active"), then drops three kinds the
+               owner's production list_groups.py never listed (list_exclusion():
+               admin-owned broadcast channels, monoforum inboxes, Stars-
+               subscription groups). Reports the group IDs plus a full bucket
+               breakdown to /leave-report (mode=list); the Worker turns the IDs
+               into a .txt file and sends it to the admin. A run that cannot
+               finish (error, or LIST_TIME_BUDGET_SECONDS used up) reports an
+               explicit error -- never a partial list that looks complete.
+
 Env vars (required): ACCOUNT (credentials resolved by tg_accounts.py),
 MODE, SCAN_ID -- see leave.yml for where these come from.
 
@@ -136,6 +148,13 @@ LEAVE_SCOPES = {
 # hear nothing. No new leave is STARTED after this budget; the run reports
 # what it did and the rest is left for the next /leavescan.
 LEAVE_TIME_BUDGET_SECONDS = int(os.environ.get("LEAVE_TIME_BUDGET_SECONDS", str(16 * 60)))
+
+# Phase 19 (2026-10-29): MODE=list. Same 20-minute job cap as leave, so the run
+# stops itself first and reports an explicit error instead of being killed
+# silently. EXCLUDE_PAID_SUB carries over the owner's production setting
+# (Stars-subscription groups count as "paid", not active); set to 0 to keep them.
+LIST_TIME_BUDGET_SECONDS = int(os.environ.get("LIST_TIME_BUDGET_SECONDS", str(17 * 60)))
+EXCLUDE_PAID_SUB = os.environ.get("EXCLUDE_PAID_SUB", "1") != "0"
 
 # Telegram API calls made through _with_floodwait_retry(). scan/status only
 # pace themselves (1-2 s) after a group that actually cost an API call; an
@@ -511,6 +530,93 @@ def scan_account_status(client) -> dict:
     return counts
 
 
+def list_exclusion(entity):
+    """MODE=list only. Why a group the account CAN send in (evaluate() says
+    "active") is still not wanted in the ID list -- or None to keep it. These
+    are the rules of the owner's production list_groups.py that the shared
+    classifier deliberately does not apply, so /account_status and /leavescan
+    keep their meaning:
+      channel           - a broadcast channel the account administers.
+                          evaluate() calls any admin "active" (admins can post),
+                          but a channel is not a group.
+      monoforum         - a channel's direct-messages inbox, not a group.
+      paid_subscription - a Stars-subscription group (EXCLUDE_PAID_SUB)."""
+    if not isinstance(entity, Channel):
+        return None  # legacy chats are always plain groups
+    if getattr(entity, "monoforum", False):
+        return "monoforum"
+    if not getattr(entity, "megagroup", False):
+        return "channel"
+    if EXCLUDE_PAID_SUB and getattr(entity, "subscription_until_date", None):
+        return "paid_subscription"
+    return None
+
+
+def scan_active_group_ids(client, budget_seconds=None, clock=time.monotonic) -> dict:
+    """Read-only snapshot for /listgroups_py. Every live group lands in exactly
+    ONE bucket, so   total == active + restricted + paid_messages + read_only
+    + broadcast + unchecked + sum(excluded)   always holds (logged if not).
+      group_ids - Telegram peer ids (the -100... form) of the active groups, in
+                  dialog order, each once
+      active    - len(group_ids): the account can send there AND list_exclusion()
+                  has nothing against it
+      excluded  - active-by-classifier groups list_exclusion() dropped, by reason
+      unchecked - Telegram wouldn't let us judge; NOT in group_ids (reported so
+                  the admin knows the list may be short -- re-run later)
+    Raises RuntimeError if LIST_TIME_BUDGET_SECONDS runs out before every group
+    was checked: a partial list would look like a complete one."""
+    budget = LIST_TIME_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    started = clock()
+    me = client.get_me()
+    now = _now()
+    counts = {"total": 0, "active": 0, "restricted": 0, "paid_messages": 0,
+              "read_only": 0, "broadcast": 0, "unchecked": 0}
+    excluded = {"channel": 0, "monoforum": 0, "paid_subscription": 0}
+    ids = []
+    seen = set()
+    skipped = {}
+
+    for dialog in client.iter_dialogs():
+        if not (dialog.is_group or dialog.is_channel):
+            continue
+        entity = dialog.entity
+        live, why = is_live_group(entity)
+        if not live:
+            skipped[why] = skipped.get(why, 0) + 1
+            continue
+        if dialog.id in seen:  # same group returned twice (e.g. archive + main folder)
+            skipped["duplicate_dialog"] = skipped.get("duplicate_dialog", 0) + 1
+            continue
+        seen.add(dialog.id)
+        if budget and clock() - started > budget:
+            raise RuntimeError(f"time_budget_exceeded:{counts['total']}_groups_checked_of_more")
+        counts["total"] += 1
+
+        calls_before = _TG_CALLS
+        info = evaluate(client, entity, me.id, now)
+        bucket = info["bucket"]
+        if bucket == "unchecked":
+            print(f"[list] couldn't check {dialog.id}: {info.get('error')}")
+            counts["unchecked"] += 1
+        elif bucket == "active":
+            reason = list_exclusion(entity)
+            if reason:
+                excluded[reason] += 1
+            else:
+                ids.append(dialog.id)
+                counts["active"] += 1
+        else:
+            counts["restricted" if bucket == "muted" else bucket] += 1
+        if _TG_CALLS != calls_before:  # pace only after a real API call
+            time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
+
+    parts = sum(v for k, v in counts.items() if k != "total") + sum(excluded.values())
+    if parts != counts["total"]:
+        print(f"::error title=List buckets don't add up::total={counts['total']} sum={parts}")
+    print(f"[list] {counts} excluded={excluded} listed={len(ids)} skipped_not_live={skipped}")
+    return {"group_ids": ids, **counts, "excluded": excluded}
+
+
 def _verify_and_leave(client, me_id, c, scope="all") -> dict:
     """Re-checks ONE candidate against Telegram's CURRENT state right before
     leaving (the admin's tap can come hours after the scan: a group may have
@@ -696,6 +802,23 @@ def main():
             sys.exit(1)
 
         if not report({"mode": "status", "account": ACCOUNT, "scan_id": SCAN_ID, **counts}):
+            sys.exit(1)
+        return
+
+    if MODE == "list":
+        try:
+            _require_tl_fields()
+            with make_client(ACCOUNT) as client:
+                result = scan_active_group_ids(client)
+        except Exception as e:
+            print(f"[unexpected] list failed: {type(e).__name__}: {e}")
+            # An explicit error, NOT an empty list: the Worker would send a
+            # "[]" file / "0 active groups" as if that were the real answer.
+            report({"mode": "list", "account": ACCOUNT, "scan_id": SCAN_ID,
+                     "error": _error_text(e)})
+            sys.exit(1)
+
+        if not report({"mode": "list", "account": ACCOUNT, "scan_id": SCAN_ID, **result}):
             sys.exit(1)
         return
 
