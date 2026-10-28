@@ -95,8 +95,12 @@ def status(entities, **kw):
     return lg.scan_account_status(FakeClient(entities, **kw))
 
 def scan(entities, **kw):
-    total, cands = lg.scan_leave_candidates(FakeClient(entities, **kw))
+    total, cands, _unchecked = lg.scan_leave_candidates(FakeClient(entities, **kw))
     return total, {int(c["peer_id"]): c for c in cands}
+
+def scan_u(entities, **kw):
+    total, cands, unchecked = lg.scan_leave_candidates(FakeClient(entities, **kw))
+    return total, {int(c["peer_id"]): c for c in cands}, unchecked
 
 def buckets_sum(s):
     return sum(s.get(k, 0) for k in ("active", "restricted", "paid_messages", "read_only", "broadcast", "unchecked"))
@@ -110,8 +114,9 @@ s = status([megagroup(4)], participants={4: banned(restrict(EPOCH))})
 case("baseline: forever-muted (until_date=0 -> epoch) counted restricted", s["restricted"] == 1, str(s))
 
 t, c = scan([broadcast(5, participants_count=12), broadcast(6, participants_count=60), broadcast(7, participants_count=10)])
-case("baseline: under-50 (view-only channels only) uses entity count (12 flagged, 60 not, 10 flagged)",
-     set(c) == {-1000000000005, -1000000000007} and c[-1000000000005]["member_count"] == 12,
+case("baseline (Phase 18): view-only channels: 12 / 10 members -> under_50_members, 60 -> view_only (not dropped silently)",
+     {k: v["reason"] for k, v in c.items()} == {-1000000000005: "under_50_members", -1000000000006: "view_only", -1000000000007: "under_50_members"}
+     and c[-1000000000005]["member_count"] == 12 and c[-1000000000006]["member_count"] == 60,
      str({k: v["reason"] for k, v in c.items()}))
 
 # ---------- C1: unreadable group must not silently vanish from the buckets ----------
@@ -249,8 +254,9 @@ case("A1 scan: SMALL but active groups (12 / 60 / 10 members) are NOT leave cand
      str({k: v["reason"] for k, v in c.items()}))
 e1, e2 = broadcast(114, participants_count=10), broadcast(115, participants_count=500)
 t, c = scan([e1, e2])
-case("A2 scan: view-only channel (not active) under the threshold is still flagged; big one is not",
-     set(c) == {pid(e1)}, str({k: v["reason"] for k, v in c.items()}))
+case("A2 scan (Phase 18): view-only channels are flagged by size: <50 -> under_50_members, 500 -> view_only",
+     {k: v["reason"] for k, v in c.items()} == {pid(e1): "under_50_members", pid(e2): "view_only"},
+     str({k: v["reason"] for k, v in c.items()}))
 e = megagroup(116, participants_count=20)
 fc = FakeClient([e])
 res, ab = lg.leave_confirmed_groups(fc, [{"peer_id": str(pid(e)), "title": "x", "reason": "under_50_members"}])
@@ -270,7 +276,9 @@ def fuzz():
     adms = [{}, {"creator": True}, {"admin_rights": T.ChatAdminRights()}]
     parts = [None, banned(restrict(EPOCH)), banned(plain_only()), banned(BOT_MUTE), banned(plain_only(view=True)),
              T.ChannelParticipantLeft(peer=T.PeerUser(ME)), errors.ChannelPrivateError(None),
-             T.ChannelParticipantAdmin(user_id=ME, promoted_by=1, date=NOW, admin_rights=T.ChatAdminRights())]
+             T.ChannelParticipantAdmin(user_id=ME, promoted_by=1, date=NOW, admin_rights=T.ChatAdminRights()),
+             banned(T.ChatBannedRights(until_date=EPOCH, send_stickers=True)),   # per-user record, text allowed
+             banned(restrict(NOW - timedelta(days=1)))]                        # expired restriction record
     n_cases, problems, i = 0, [], 1000
     for kind, dflt, adm, stars, n, p in itertools.product(
             ["mega", "bcast", "legacy", "giga"], [None, READ_ONLY, READ_ONLY_PLAIN], adms, [None, 5], [5, 500], parts):
@@ -282,17 +290,171 @@ def fuzz():
         label = f"{kind} dflt={'-' if dflt is None else 'x'} adm={list(adm)} stars={stars} n={n} part={type(p).__name__}"
         with contextlib.redirect_stdout(io.StringIO()):
             st = lg.scan_account_status(FakeClient([ent], participants=pm))
-            _, cands = lg.scan_leave_candidates(FakeClient([ent], participants=pm, full_totals={i: n}))
+            _, cands, _u = lg.scan_leave_candidates(FakeClient([ent], participants=pm, full_totals={i: n}))
             fc = FakeClient([ent], participants=pm, full_totals={i: n})
-            lg.leave_confirmed_groups(fc, [{"peer_id": str(pid(ent)), "title": "x", "reason": "under_50_members"}])
+            lg.leave_confirmed_groups(fc, [{"peer_id": str(pid(ent)), "title": "x", "reason": "under_50_members"}], "all")
+            fc2 = FakeClient([ent], participants=pm, full_totals={i: n})
+            lg.leave_confirmed_groups(fc2, [{"peer_id": str(pid(ent)), "title": "x", "reason": "view_only"}], "rvp")
         n_cases += 1
         if st["total"] != buckets_sum(st): problems.append("sum!=total " + label)
         if st["active"] == 1 and cands: problems.append("ACTIVE group offered for leaving: " + label)
         if st["active"] == 1 and getattr(fc, "left", None): problems.append("ACTIVE group was LEFT: " + label)
+        if st["active"] == 1 and getattr(fc2, "left", None): problems.append("ACTIVE group was LEFT by rvp: " + label)
+        if st["unchecked"] == 1 and (cands or getattr(fc, "left", None) or getattr(fc2, "left", None)):
+            problems.append("UNCHECKED group offered/left: " + label)
+        if st["restricted"] == 1 and getattr(fc2, "left", None): problems.append("MUTED group left by rvp: " + label)
+        if st["broadcast"] == 1 and n >= 50 and getattr(fc, "left", None): problems.append("big view-only left by 'all': " + label)
     return n_cases, problems
 n_cases, problems = fuzz()
 case(f"A4 invariant over {n_cases} generated situations: active is never offered/left, total == sum(buckets)",
      not problems, f"{len(problems)} problems; first: {problems[:3]}")
+
+# =====================================================================
+# Phase 18 (2026-10-28): scopes ("all" = original Yes, "rvp" = read-only +
+# view-only + paid), every view-only channel offered, per-user-exception
+# guard, time budget, stop-on-rate-limit, pacing, unchecked reported.
+# =====================================================================
+def leave(entities, cands, scope, participants=None, full_totals=None, client_cls=None, **kw):
+    fc = (client_cls or FakeClient)(entities, participants=participants, full_totals=full_totals)
+    res, ab = lg.leave_confirmed_groups(fc, [dict(peer_id=str(pid(e)), title="x", reason=r) for e, r in cands], scope, **kw)
+    return fc, res, ab
+
+# --- P1/P2: which channels become candidates
+e_big, e_small, e_unk = broadcast(201, participants_count=500), broadcast(202, participants_count=7), broadcast(203)
+t, c = scan([e_big, e_small, e_unk], full_totals={203: 90})
+case("P1 scan: 500 -> view_only, 7 -> under_50_members, count resolved via GetFullChannel (90) -> view_only",
+     {k: v["reason"] for k, v in c.items()} == {pid(e_big): "view_only", pid(e_small): "under_50_members", pid(e_unk): "view_only"}
+     and c[pid(e_unk)]["member_count"] == 90, str(c))
+t, c = scan([megagroup(204, participants_count=500), megagroup(205, participants_count=3), legacy(206, count=2)])
+case("P1b scan: ACTIVE groups are still never candidates, at any size (owner's rule)", c == {}, str(c))
+
+# --- P3..P6: scopes decide what a tap may leave
+e_ro, e_paid, e_mute, e_vo, e_u50 = (megagroup(211, default_banned_rights=READ_ONLY), megagroup(212, send_paid_messages_stars=5),
+                                     megagroup(213), broadcast(214, participants_count=900), broadcast(215, participants_count=5))
+ents = [e_ro, e_paid, e_mute, e_vo, e_u50]
+parts = {213: banned(restrict(EPOCH))}
+cands = [(e_ro, "read_only"), (e_paid, "paid_messages"), (e_mute, "muted"), (e_vo, "view_only"), (e_u50, "under_50_members")]
+fc, res, ab = leave(ents, cands, "rvp", participants=parts)
+by = {r["peer_id"]: r for r in res}
+case("P3 rvp: read-only + paid + big view-only + small view-only are LEFT",
+     all(by[str(pid(e))]["status"] == "left" for e in (e_ro, e_paid, e_vo, e_u50)), str(res))
+case("P4 rvp: a MUTED group is never left by the rvp button (skipped, outside_selected_scope:muted)",
+     by[str(pid(e_mute))]["status"] == "skipped" and by[str(pid(e_mute))]["detail"] == "outside_selected_scope:muted"
+     and e_mute.id not in getattr(fc, "left", []), str(by[str(pid(e_mute))]))
+fc, res, ab = leave(ents, cands, "all", participants=parts)
+by = {r["peer_id"]: r for r in res}
+case("P5 all (original Yes): muted + read-only + paid + under-50 are left, exactly as before",
+     all(by[str(pid(e))]["status"] == "left" for e in (e_ro, e_paid, e_mute, e_u50)), str(res))
+case("P6 all (original Yes): a big view-only channel is NOT left (it was never part of the original Yes)",
+     by[str(pid(e_vo))]["status"] == "skipped" and by[str(pid(e_vo))]["detail"] == "outside_selected_scope:view_only"
+     and e_vo.id not in getattr(fc, "left", []), str(by[str(pid(e_vo))]))
+e_grew = broadcast(216, participants_count=40)
+e_grew.participants_count = 400  # grew since the scan
+fc, res, ab = leave([e_grew], [(e_grew, "under_50_members")], "all")
+case("P6b all: an under_50 channel that grew past the threshold since the scan is skipped (as before)", res[0]["status"] == "skipped", str(res))
+
+# --- P7: nothing the account can send in is ever left, in any scope
+e_act, e_adm = megagroup(221, participants_count=900), megagroup(222, admin_rights=T.ChatAdminRights())
+for sc in ("all", "rvp"):
+    fc, res, ab = leave([e_act, e_adm], [(e_act, "read_only"), (e_adm, "view_only")], sc)
+    case(f"P7 {sc}: active group / admin group with a forged candidate row -> skipped, never left",
+         [r["status"] for r in res] == ["skipped", "skipped"] and not getattr(fc, "left", None), str(res))
+
+# --- P8: per-user record inside a read-only group is ambiguous -> never touched
+EXC = T.ChatBannedRights(until_date=EPOCH, send_stickers=True)           # text allowed for THIS user
+e_x = megagroup(231, default_banned_rights=READ_ONLY)
+s = status([e_x], participants={231: banned(EXC)})
+t, c, unc = scan_u([e_x], participants={231: banned(EXC)})
+case("P8 read-only group + a per-user record that allows text -> 'unchecked' (not read_only), not a candidate, counted in scan",
+     s["unchecked"] == 1 and s["read_only"] == 0 and c == {} and unc == 1, f"{s} cands={c} unchecked={unc}")
+s = status([e_x], participants={231: banned(restrict(NOW - timedelta(days=1)))})
+case("P8b read-only group + EXPIRED restriction record -> also unchecked (can't prove the account can't send)", s["unchecked"] == 1, str(s))
+fc, res, ab = leave([e_x], [(e_x, "read_only")], "rvp", participants={231: banned(EXC)})
+case("P8c leave: such a group is skipped even if a stale row says read_only", res[0]["status"] == "skipped" and not getattr(fc, "left", None), str(res))
+e_plain = megagroup(232, default_banned_rights=READ_ONLY)
+s = status([e_plain])
+case("P8d read-only group where the account is a plain member (no record) is still read_only", s["read_only"] == 1, str(s))
+
+# --- P9: bad scope
+try:
+    lg.leave_confirmed_groups(FakeClient([]), [], "everything"); bad_scope = False
+except ValueError:
+    bad_scope = True
+case("P9 unknown scope -> ValueError, nothing runs", bad_scope)
+
+# --- P10: time budget stops NEW leaves; the report still happens
+class Tick:
+    def __init__(self): self.t = 0
+    def __call__(self): self.t += 10; return self.t
+chans = [broadcast(240 + k, participants_count=300) for k in range(6)]
+fc, res, ab = leave(chans, [(e, "view_only") for e in chans], "rvp", budget_seconds=35, clock=Tick())
+case("P10 time budget: run stops starting new leaves, aborted_early=True, the untouched rest is not attempted",
+     ab is True and 0 < len(res) < 6 and len(getattr(fc, "left", [])) == len(res), f"results={len(res)} aborted={ab}")
+fc, res, ab = leave(chans, [(e, "view_only") for e in chans], "rvp", budget_seconds=0)
+case("P10b budget 0 = unlimited (all 6 processed)", len(res) == 6 and ab is False, f"{len(res)} {ab}")
+
+# --- P11..P13: rate limits
+class FloodOnDelete(FakeClient):
+    def __init__(self, *a, seconds=500, times=99, **k):
+        super().__init__(*a, **k); self.seconds, self.times, self.n = seconds, times, 0
+    def delete_dialog(self, entity):
+        self.n += 1
+        if self.n <= self.times: raise errors.FloodWaitError(None, self.seconds)
+        return super().delete_dialog(entity)
+fcx = FloodOnDelete(chans[:3], seconds=500)
+res, ab = lg.leave_confirmed_groups(fcx, [dict(peer_id=str(pid(e)), title="x", reason="view_only") for e in chans[:3]], "rvp")
+case("P11 a FloodWait too long to wait out STOPS the run (1 attempt, not 3 hammering calls), aborted_early=True",
+     len(res) == 1 and fcx.n == 1 and ab is True and res[0]["detail"].startswith("floodwait_500s"), f"n={fcx.n} {res} {ab}")
+fcx = FloodOnDelete(chans[:2], seconds=5, times=1)
+res, ab = lg.leave_confirmed_groups(fcx, [dict(peer_id=str(pid(e)), title="x", reason="view_only") for e in chans[:2]], "rvp")
+case("P12 a short FloodWait is waited out and the group is still left", [r["status"] for r in res] == ["left", "left"] and not ab, str(res))
+fcx = FloodOnDelete(chans[:3], seconds=5, times=99)
+res, ab = lg.leave_confirmed_groups(fcx, [dict(peer_id=str(pid(e)), title="x", reason="view_only") for e in chans[:3]], "rvp")
+case("P12b FloodWait that keeps coming back after one retry also stops the run", len(res) == 1 and ab is True, f"{res} {ab}")
+class PeerFloodOnDelete(FakeClient):
+    def delete_dialog(self, entity): raise errors.PeerFloodError(None)
+fcx = PeerFloodOnDelete(chans[:3])
+res, ab = lg.leave_confirmed_groups(fcx, [dict(peer_id=str(pid(e)), title="x", reason="view_only") for e in chans[:3]], "rvp")
+case("P13 PeerFlood still stops the run after the first group", len(res) == 1 and ab is True and res[0]["detail"] == "peer_flood_detected", str(res))
+
+# --- P14: pacing sleeps only after a real API call
+slept = []
+_orig_sleep = time.sleep
+time.sleep = lambda s: slept.append(s)
+lg.scan_leave_candidates(FakeClient([megagroup(251, admin_rights=T.ChatAdminRights()), megagroup(252, creator=True), legacy(253), legacy(254)]))
+no_api = len(slept)
+slept.clear()
+lg.scan_leave_candidates(FakeClient([megagroup(255), megagroup(256)]))
+with_api = len(slept)
+time.sleep = _orig_sleep
+case("P14 scan: no pacing sleep for admin/legacy groups (0 API calls), one per group that cost a call (2)", (no_api, with_api) == (0, 2), f"{no_api}, {with_api}")
+
+# --- P15: scan report carries the unchecked count; leave with a bad SCOPE exits 1 before touching Telegram
+class CM(FakeClient):
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+def run_main(mode, client, scope=None):
+    sent, saved = [], (lg.MODE, lg.make_client, lg.report, lg.SCOPE, lg.fetch_candidates)
+    made = []
+    lg.MODE, lg.make_client = mode, (lambda account: made.append(1) or client)
+    lg.report = lambda payload: sent.append(payload) or True
+    lg.fetch_candidates = lambda: [dict(peer_id="1", title="x", reason="view_only")]
+    if scope is not None: lg.SCOPE = scope
+    code = None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            lg.main()
+    except SystemExit as ex:
+        code = ex.code
+    finally:
+        lg.MODE, lg.make_client, lg.report, lg.SCOPE, lg.fetch_candidates = saved
+    return code, sent, made
+code, sent, made = run_main("scan", CM([megagroup(261), megagroup(262)], participants={262: errors.ChannelPrivateError(None)}))
+case("P15 scan report includes unchecked=1 (a group Telegram wouldn't let us judge is not silent)",
+     code is None and sent and sent[0].get("unchecked") == 1 and sent[0]["total_dialogs"] == 2, str(sent))
+code, sent, made = run_main("leave", CM([]), scope="bogus")
+case("P15b leave with an unknown SCOPE: exit 1, reports aborted (flags get cleared), Telegram never contacted",
+     code == 1 and sent and sent[0].get("aborted_early") is True and not made, f"code={code} sent={sent} made={made}")
 
 # ---------- F: a failed run must not report fake zeros as a result ----------
 def run_main_failing(mode):

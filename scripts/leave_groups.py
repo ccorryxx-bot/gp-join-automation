@@ -7,7 +7,9 @@ Phase 8 (2026-09-23): "leave muted groups" automation, invoked by
                (admin-restricted: text banned but view_messages=False, i.e.
                not fully kicked/banned), read_only (sending off for everyone),
                paid_messages (Stars per message), and view-only channels
-               with fewer than MIN_MEMBERS_THRESHOLD members. A group where
+               with fewer than MIN_MEMBERS_THRESHOLD members ("under_50_members")
+               -- and, since Phase 18, EVERY other view-only channel too
+               ("view_only", any size). A group where
                the account CAN send messages is "active" and is NEVER a
                candidate, whatever its size (owner's rule, 2026-10-17; before
                that, small active groups were offered as "under_50_members").
@@ -21,6 +23,15 @@ Phase 8 (2026-09-23): "leave muted groups" automation, invoked by
                actually leaves each one with a short randomized delay
                between calls, and reports the full per-group result list
                back in a single POST to /leave-report (mode=leave).
+               SCOPE (env, default "all") says which button the admin
+               tapped; every candidate is re-verified against Telegram's
+               CURRENT state and is only left if that state is inside the
+               scope (see LEAVE_SCOPES). An active / admin / unverifiable
+               group is never left, whatever the candidate row says. The run
+               stops starting new leaves after LEAVE_TIME_BUDGET_SECONDS so
+               it always reports before the 20-minute job timeout, and stops
+               at the first PeerFlood / over-budget FloodWait instead of
+               hammering a rate-limited account.
 
   MODE=status - read-only. Phase 11 (2026-09-28), invoked by the admin's
                /account_status bot command. Same dialog walk as MODE=scan's
@@ -101,6 +112,36 @@ MAX_FLOODWAIT_AUTO_RETRY_SECONDS = 120
 # (admin-restricted) groups. Overridable via env var, same convention as
 # PEER_FLOOD_PAUSE_HOURS on the Worker side, without needing a redeploy.
 MIN_MEMBERS_THRESHOLD = int(os.environ.get("MIN_MEMBERS_THRESHOLD", "50"))
+
+# Phase 18 (2026-10-28): what the admin's confirm button is allowed to leave.
+# Passed by the Worker as the SCOPE workflow input (MODE=leave only).
+#   all - the original "Yes, Leave": muted, read-only, paid-message groups and
+#         view-only channels UNDER the member threshold. Big view-only
+#         channels are deliberately NOT in here (they were never offered
+#         before), so an old habit of tapping "Yes" can't start dropping them.
+#   rvp - "read-only + view-only + paid": read_only, paid_messages and EVERY
+#         view-only channel (view_only = any size, under_50_members = small).
+#         Never muted.
+# The scope is checked against the CURRENT, re-verified state of each group,
+# not against what the scan row says.
+SCOPE = os.environ.get("SCOPE", "all")
+LEAVE_SCOPES = {
+    "all": frozenset({"muted", "read_only", "paid_messages", "under_50_members"}),
+    "rvp": frozenset({"read_only", "paid_messages", "view_only", "under_50_members"}),
+}
+
+# The job has timeout-minutes: 20 (leave.yml). A batch of 100+ channels at
+# 3-8 s each plus verification can outlast that, and a killed job never
+# reports -- the scan row would stay 'leaving' forever and the admin would
+# hear nothing. No new leave is STARTED after this budget; the run reports
+# what it did and the rest is left for the next /leavescan.
+LEAVE_TIME_BUDGET_SECONDS = int(os.environ.get("LEAVE_TIME_BUDGET_SECONDS", str(16 * 60)))
+
+# Telegram API calls made through _with_floodwait_retry(). scan/status only
+# pace themselves (1-2 s) after a group that actually cost an API call; an
+# admin/legacy-chat dialog costs none, and sleeping there only stretched a
+# 400-group scan past the 10-minute "leave:running" safety flag.
+_TG_CALLS = 0
 
 # Same Cloudflare Browser Integrity Check workaround as join_telegram.py --
 # see that file's comment for the full root-cause writeup.
@@ -249,7 +290,9 @@ def mute_state(rights, now):
 def _with_floodwait_retry(fn, tag):
     """Run fn(); on a short FloodWait sleep and retry ONCE (the old code just
     skipped the group). Anything else propagates to the caller."""
+    global _TG_CALLS
     try:
+        _TG_CALLS += 1
         return fn()
     except FloodWaitError as e:
         if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
@@ -257,6 +300,7 @@ def _with_floodwait_retry(fn, tag):
             raise
         print(f"[{tag}] FloodWait {e.seconds}s -- sleeping, then retrying once")
         time.sleep(e.seconds + 1)
+        _TG_CALLS += 1
         return fn()
 
 
@@ -290,6 +334,7 @@ def evaluate(client, entity, me_id, now):
         return info
 
     is_channel = isinstance(entity, Channel)
+    default_rights = getattr(entity, "default_banned_rights", None)
     if is_channel:
         try:
             participant = _with_floodwait_retry(
@@ -312,8 +357,19 @@ def evaluate(client, entity, me_id, now):
             if muted:
                 info.update(bucket="muted", muted_until=until.isoformat() if until else None)
                 return info
+            if default_rights and text_banned(default_rights):
+                # Phase 18 safety guard. The group is read-only for everyone by
+                # default, but Telegram holds a per-user record for THIS account
+                # that does not (any longer) ban text: either an admin-granted
+                # exception ("this member may post") or an expired restriction.
+                # Telegram's permission exceptions can lift a default, so we
+                # cannot prove the account is unable to send -- and a group the
+                # account can send in must never be left. Treat it as
+                # unverifiable: counted as 'unchecked', never a leave candidate.
+                # 🟡 conservative by design; not confirmed live which of the two
+                # cases a given group is.
+                return {"bucket": "unchecked", "admin": False, "error": "per_user_record_in_read_only_group"}
 
-    default_rights = getattr(entity, "default_banned_rights", None)
     stars = getattr(entity, "send_paid_messages_stars", None) if is_channel else None
     if default_rights and text_banned(default_rights):
         info["bucket"] = "read_only"      # group-wide: nobody but admins can send
@@ -326,9 +382,11 @@ def evaluate(client, entity, me_id, now):
 
 def leave_reason(client, entity, info):
     """Leave reason for an evaluated group, or None. Only groups where this
-    account cannot send messages can have one. NEVER a candidate: an active
-    group (the account can send), an admin/creator group, or an unreadable
-    group ("unchecked") that can't be judged."""
+    account cannot send messages can have one:
+      muted | read_only | paid_messages | under_50_members | view_only
+    NEVER a candidate: an active group (the account can send), an
+    admin/creator group, or an unreadable group ("unchecked") that can't be
+    judged."""
     if info["admin"]:
         return None, {}
     bucket = info["bucket"]
@@ -339,11 +397,15 @@ def leave_reason(client, entity, info):
     if bucket == "paid_messages":
         return "paid_messages", {"stars_price": info["stars_price"]}
     if bucket == "broadcast":
-        # View-only channel: not active (members can't post). Size is the only
-        # signal we act on here.
+        # View-only channel: not active (members can't post), so it can be
+        # offered whatever its size. Small ones keep the original reason
+        # "under_50_members" (still in the original "Yes, Leave" scope);
+        # bigger ones are "view_only", which only the "rvp" button leaves.
         count = get_member_count(client, entity)
+        extra = {"member_count": count} if count is not None else {}
         if count is not None and count < MIN_MEMBERS_THRESHOLD:
-            return "under_50_members", {"member_count": count}
+            return "under_50_members", extra
+        return "view_only", extra
     # bucket == "active": the account can send messages here -> never a
     # candidate, however small the group is.
     return None, {}
@@ -355,11 +417,13 @@ def _public_url(entity):
 
 
 def scan_leave_candidates(client) -> tuple:
-    """Returns (total_groups, candidates). total_groups counts only groups and
-    channels the account is actually in (no private chats/bots/Saved
-    Messages, no migrated/deactivated legacy chats, no groups it was removed
-    from). A group is reported under at most ONE reason, priority:
-      muted > read_only > paid_messages > under_50_members
+    """Returns (total_groups, candidates, unchecked). total_groups counts only
+    groups and channels the account is actually in (no private chats/bots/
+    Saved Messages, no migrated/deactivated legacy chats, no groups it was
+    removed from). `unchecked` = live groups Telegram wouldn't let us judge;
+    they are never candidates and are reported so the admin knows they exist.
+    A group is reported under at most ONE reason, priority:
+      muted > read_only > paid_messages > under_50_members / view_only
     Admin/creator groups are never candidates. Candidates carry "url" (public
     groups only) and, per reason, member_count / stars_price / muted_until
     (set only for a temporary mute)."""
@@ -380,6 +444,7 @@ def scan_leave_candidates(client) -> tuple:
             continue
         total += 1
 
+        calls_before = _TG_CALLS
         info = evaluate(client, entity, me.id, now)
         if info["bucket"] == "unchecked":
             unchecked += 1
@@ -395,10 +460,11 @@ def scan_leave_candidates(client) -> tuple:
                     "url": _public_url(entity),
                     **extra,
                 })
-        time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
+        if _TG_CALLS != calls_before:  # pace only after a real API call
+            time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
 
     print(f"[scan] total={total} candidates={len(candidates)} unchecked={unchecked} skipped_not_live={skipped}")
-    return total, candidates
+    return total, candidates, unchecked
 
 
 def scan_account_status(client) -> dict:
@@ -430,11 +496,13 @@ def scan_account_status(client) -> dict:
         counts["total"] += 1
         archived += 1 if getattr(dialog, "archived", False) else 0
 
+        calls_before = _TG_CALLS
         info = evaluate(client, entity, me.id, now)
         if info["bucket"] == "unchecked":
             print(f"[status] couldn't check {dialog.id}: {info.get('error')}")
         counts["restricted" if info["bucket"] == "muted" else info["bucket"]] += 1
-        time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
+        if _TG_CALLS != calls_before:  # pace only after a real API call
+            time.sleep(random.uniform(*SCAN_PER_GROUP_DELAY_SECONDS))
 
     parts = sum(v for k, v in counts.items() if k != "total")
     if parts != counts["total"]:
@@ -443,12 +511,13 @@ def scan_account_status(client) -> dict:
     return counts
 
 
-def _verify_and_leave(client, me_id, c) -> dict:
+def _verify_and_leave(client, me_id, c, scope="all") -> dict:
     """Re-checks ONE candidate against Telegram's CURRENT state right before
-    leaving (the admin's Yes can come hours after the scan: a group may have
+    leaving (the admin's tap can come hours after the scan: a group may have
     grown past the member threshold, been un-muted, or the account may have
-    been made admin since). Only leaves if it still qualifies under ANY leave
-    reason; anything unverifiable is skipped, never left on a guess."""
+    been made admin since). Only leaves if the CURRENT state is a leave
+    reason that the tapped button's scope covers (LEAVE_SCOPES); anything
+    unverifiable is skipped, never left on a guess."""
     peer_id = c["peer_id"]
     entity = client.get_entity(int(peer_id))  # fresh fetch, not the scan-time snapshot
 
@@ -467,6 +536,11 @@ def _verify_and_leave(client, me_id, c) -> dict:
     reason, _ = leave_reason(client, entity, info)
     if not reason:
         return {"peer_id": peer_id, "status": "skipped", "detail": "no_longer_matches_any_leave_reason"}
+    if reason not in LEAVE_SCOPES[scope]:
+        # e.g. the "rvp" button was tapped but the account got muted here in the
+        # meantime, or an "under_50" channel grew past the threshold under the
+        # original "Yes" -- not what the admin confirmed, so not touched.
+        return {"peer_id": peer_id, "status": "skipped", "detail": f"outside_selected_scope:{reason}"}
 
     # delete_dialog picks the right underlying call (LeaveChannel for
     # channels/supergroups, DeleteChatUser for legacy groups).
@@ -475,9 +549,19 @@ def _verify_and_leave(client, me_id, c) -> dict:
     return {"peer_id": peer_id, "status": "left", "detail": ""}
 
 
-def leave_confirmed_groups(client, candidates: list) -> tuple:
+def leave_confirmed_groups(client, candidates: list, scope: str = "all",
+                           budget_seconds=None, clock=time.monotonic) -> tuple:
     """Returns (results, aborted_early). Result statuses: left | skipped
-    (re-check says it no longer qualifies / can't be verified) | failed."""
+    (re-check says it no longer qualifies / is outside the tapped scope / can't
+    be verified) | failed. aborted_early=True means the run STOPPED before
+    working through every candidate (account-wide PeerFlood, a FloodWait too
+    long to wait out, or the time budget); the untouched rest stays 'pending'
+    in the Worker's DB."""
+    if scope not in LEAVE_SCOPES:
+        raise ValueError(f"unknown_scope:{scope}")
+    budget = LEAVE_TIME_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    started = clock()
+
     # get_entity(int_id) alone can fail to resolve a channel in a *fresh*
     # session because Telethon needs an access_hash it only learns from a
     # dialogs call first; iter_dialogs() warms that cache for every group
@@ -490,26 +574,40 @@ def leave_confirmed_groups(client, candidates: list) -> tuple:
 
     for c in candidates:
         peer_id = c["peer_id"]
+        if budget and clock() - started > budget:
+            print(f"[leave] time budget ({budget}s) used up -- stopping; the rest stays pending")
+            aborted_early = True
+            break
+
+        stop = False
         try:
-            res = _verify_and_leave(client, me_id, c)
+            res = _verify_and_leave(client, me_id, c, scope)
         except FloodWaitError as e:
             if e.seconds > MAX_FLOODWAIT_AUTO_RETRY_SECONDS:
-                results.append({"peer_id": peer_id, "status": "failed",
-                                 "detail": f"floodwait_{e.seconds}s_exceeded_budget"})
-                continue
-            print(f"[leave] FloodWait {e.seconds}s -- sleeping")
-            time.sleep(e.seconds + 1)
-            try:
-                res = _verify_and_leave(client, me_id, c)
-            except Exception as e2:
+                # The account is rate-limited for longer than we will wait.
+                # Carrying on would just hit the same wall for every remaining
+                # group (and ignoring a FloodWait is what escalates it) -- stop.
                 res = {"peer_id": peer_id, "status": "failed",
-                       "detail": f"unexpected_error:{type(e2).__name__}"}
+                       "detail": f"floodwait_{e.seconds}s_exceeded_budget"}
+                stop = True
+            else:
+                print(f"[leave] FloodWait {e.seconds}s -- sleeping")
+                time.sleep(e.seconds + 1)
+                try:
+                    res = _verify_and_leave(client, me_id, c, scope)
+                except (FloodWaitError, PeerFloodError) as e2:
+                    res = {"peer_id": peer_id, "status": "failed",
+                           "detail": ("peer_flood_detected" if isinstance(e2, PeerFloodError)
+                                      else f"floodwait_{e2.seconds}s_again")}
+                    stop = True
+                except Exception as e2:
+                    res = {"peer_id": peer_id, "status": "failed",
+                           "detail": f"unexpected_error:{type(e2).__name__}"}
         except PeerFloodError:
             # Account-wide anti-spam signal, not a per-group problem. Stop
             # leaving MORE groups this run; whatever's left stays 'pending'.
-            results.append({"peer_id": peer_id, "status": "failed", "detail": "peer_flood_detected"})
-            aborted_early = True
-            break
+            res = {"peer_id": peer_id, "status": "failed", "detail": "peer_flood_detected"}
+            stop = True
         except RPCError as e:
             res = {"peer_id": peer_id, "status": "failed", "detail": f"rpc_error_{type(e).__name__}"}
         except Exception as e:
@@ -517,6 +615,9 @@ def leave_confirmed_groups(client, candidates: list) -> tuple:
                    "detail": f"unexpected_error:{type(e).__name__}:{str(e)[:150]}"}
 
         results.append(res)
+        if stop:
+            aborted_early = True
+            break
         # Only a real leave is a "peer action" worth the long pacing delay.
         delay = LEAVE_PER_GROUP_DELAY_SECONDS if res["status"] == "left" else SCAN_PER_GROUP_DELAY_SECONDS
         time.sleep(random.uniform(*delay))
@@ -525,13 +626,13 @@ def leave_confirmed_groups(client, candidates: list) -> tuple:
 
 
 def main():
-    print(f"scan_id={SCAN_ID} account={ACCOUNT} mode={MODE}")
+    print(f"scan_id={SCAN_ID} account={ACCOUNT} mode={MODE}" + (f" scope={SCOPE}" if MODE == "leave" else ""))
 
     if MODE == "scan":
         try:
             _require_tl_fields()
             with make_client(ACCOUNT) as client:
-                total, candidates = scan_leave_candidates(client)
+                total, candidates, unchecked = scan_leave_candidates(client)
         except Exception as e:
             print(f"[unexpected] scan failed: {type(e).__name__}: {e}")
             # An explicit error, NOT "0 groups / 0 candidates": the Worker would
@@ -541,11 +642,19 @@ def main():
             sys.exit(1)
 
         if not report({"mode": "scan", "account": ACCOUNT, "scan_id": SCAN_ID,
-                        "total_dialogs": total, "candidates": candidates}):
+                        "total_dialogs": total, "candidates": candidates,
+                        "unchecked": unchecked}):
             sys.exit(1)
         return
 
     if MODE == "leave":
+        if SCOPE not in LEAVE_SCOPES:
+            # Fail BEFORE touching Telegram, but still report so the Worker
+            # clears its leave:running flag and the admin hears about it.
+            print(f"::error::Unknown SCOPE={SCOPE!r} (expected one of {sorted(LEAVE_SCOPES)})")
+            report({"mode": "leave", "account": ACCOUNT, "scan_id": SCAN_ID,
+                     "results": [], "aborted_early": True})
+            sys.exit(1)
         try:
             candidates = fetch_candidates()
         except Exception as e:
@@ -561,7 +670,7 @@ def main():
         try:
             _require_tl_fields()
             with make_client(ACCOUNT) as client:
-                results, aborted_early = leave_confirmed_groups(client, candidates)
+                results, aborted_early = leave_confirmed_groups(client, candidates, SCOPE)
         except Exception as e:
             print(f"[unexpected] leave failed: {type(e).__name__}: {e}")
             report({"mode": "leave", "account": ACCOUNT, "scan_id": SCAN_ID,

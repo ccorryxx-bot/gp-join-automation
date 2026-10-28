@@ -31,6 +31,7 @@ Full architecture: see roadmap.md (shared separately with Kyaw Gyi - add a copy 
 - [x] Phase 12 - "Extract muted group urls" button on the scan-result message (2026-09-28) — see below
 - [x] Phase 13 - `/leavescan` "Scan Both" option (2026-09-28) — see below
 - [x] Phase 17 - add account `NKST_NADI` (5 accounts total) + `tests/test_accounts_wiring.py` drift guard (2026-10-28) — **code done; its 3 GitHub secrets are added manually by the owner**
+- [x] Phase 18 - leave scopes ("read-only + view-only + paid" button), Extract button for every account, leave-run safety fixes (2026-10-28) — see "Leave scopes" below
 
 ## Bulk-URL intake (added 2026-09-22)
 
@@ -178,6 +179,8 @@ later, so there's nothing to persist beyond a short-lived
 
 ## "Extract muted group urls" button (added 2026-09-28, Phase 12)
 
+> **Superseded 2026-10-28 (Phase 18):** the button is now "🔗 Extract group urls", shown on **every** scan result, and lists candidates of **all** reasons grouped by reason (muted first). The description below is the original muted-only behaviour.
+
 A `🔗 Extract muted group urls` button now appears on the scan-result
 message (above Yes/No) whenever a scan finds at least one `muted`
 candidate. Tapping it is a **plain D1 read, nothing else** — no GitHub
@@ -221,6 +224,46 @@ merged). CH and JL use different `leave.yml` concurrency groups, so the two
 scans run in parallel. If one account is busy (already scanning, or a
 previous scan is still awaiting Yes/No), only that account reports "busy" in
 the reply; the other still starts.
+
+## Leave scopes + Extract for every account (added 2026-10-28, Phase 18)
+
+**Why the Extract button was missing on 3 of 5 accounts:** it was only drawn when the scan found a `muted` candidate (`byReason.muted.length > 0`). Accounts whose candidates were read-only / paid / small-channel only never got it. It is now always shown and extracts every candidate's url, grouped by reason, split into several messages if the list is long (Telegram's 4096-char limit).
+
+**Candidates now come in 5 reasons.** View-only channels are offered whatever their size:
+
+| Reason | Meaning | Left by "Yes, Leave" | Left by "🚪 read-only + view-only + paid" |
+|---|---|---|---|
+| `muted` | admin-restricted for this account | ✅ | ❌ never |
+| `read_only` | sending off for everyone | ✅ | ✅ |
+| `paid_messages` | Stars per message | ✅ | ✅ |
+| `under_50_members` | view-only channel, < 50 members | ✅ | ✅ |
+| `view_only` | view-only channel, 50+ members (**new**) | ❌ | ✅ |
+
+`Yes, Leave` keeps its original meaning on purpose (big view-only channels were never offered before, so an old habit of tapping Yes cannot start dropping them); scan messages already in the chat keep working (callback value `yes` unchanged). Each button shows how many groups it will leave. Tapping one leaves immediately (no second prompt), as requested.
+
+**How a tap is scoped (no schema change):** the Worker marks every pending candidate outside the tapped scope `not_selected` *before* dispatching; `/leave-candidates` returns only `pending`, so the Python run receives exactly what was chosen. A failed dispatch restores them to `pending`. `leave.yml` gets a `scope` input (`all` | `rvp`) → `SCOPE` env; the script then **re-verifies every group's current Telegram state against the same scope** (`LEAVE_SCOPES` in `leave_groups.py`, mirrored in `worker.js`; `tests/test_accounts_wiring.py` fails if the two ever differ).
+
+**Nothing the account can send in is ever left** — three independent layers: `leave_reason()` returns nothing for active/admin groups, `_verify_and_leave()` hard-stops on active/admin/unchecked, and the scope check. A forged or stale candidate row cannot get past them.
+
+**Script review — what was wrong, now fixed**
+
+| Problem found | Why it matters | Fix |
+|---|---|---|
+| A FloodWait longer than 120 s recorded one failure and **carried on** with every remaining group, each hitting the same wall. | Ignoring a FloodWait is what escalates it; with 100+ channels this hammers the account. | The run **stops** (like PeerFlood) and reports `aborted_early`. A FloodWait that comes back after the one retry also stops it. |
+| No time limit inside the run; the job dies at 20 min (`timeout-minutes`). | A big batch (every view-only channel) can outlast it → no report ever sent → scan stuck `leaving`, admin hears nothing. | No new leave is started after `LEAVE_TIME_BUDGET_SECONDS` (default 960); it reports what it did. Rest stays pending. |
+| Scan/status slept 1–2 s after **every** dialog, even admin/legacy ones that cost no API call. | A 400-group scan outlasted the 10-min `leave:running` safety flag → joins could resume while the scan still held the session. | Sleep only after a group that actually cost a Telegram call (`_TG_CALLS`). |
+| Read-only group + a per-user record for this account that does not ban text (an admin-granted exception, or an expired restriction) was counted `read_only`. | Telegram permission exceptions can let a member post in a read-only group → we could leave a group the account can send in. | Treated as `unchecked` (never counted active/read-only, never a candidate). 🟡 conservative; not confirmed live which case a given group is. |
+| Scan never told the admin how many groups it could not judge. | They silently vanished from the picture. | `unchecked` is sent in the scan report and shown ("⚠️ Group N ခု … မထိဘဲ ချန်ထားပါတယ်"). |
+| "Remaining" note promised "next 3-day cycle" (there is no cron any more). | Misleading — leftovers were never retried. | Now says to run `/leavescan` again. |
+| One D1 `batch()` for all candidates/results; one Telegram message for the whole scan / url list. | Hundreds of rows or titles exceed D1 batch / Telegram 4096-char limits → scan stuck `awaiting_confirm` with no buttons. | Writes in chunks of 50; the title listing shrinks (8 → 3 → 0 per section) but the buttons never disappear; urls are split across messages. |
+
+**Tests (offline, no Telegram/Cloudflare):** `python3 tests/test_leave_logic.py` (63 cases incl. a 1 098-situation invariant over both scopes), `node --no-warnings tests/test_worker_leave_scopes.mjs` (39 cases against a **real SQLite database built from `schema.sql`**, Node ≥ 22), `node tests/test_worker_leave_report.mjs`, `python3 tests/test_accounts_wiring.py`. Every safety rule above was mutation-checked (delete the rule → a test fails).
+
+**Known limits / verify live**
+- What Telegram returns for a given group cannot be proven offline: run `/account_status`, compare with the Telegram app, and eyeball the first `rvp` scan list before tapping.
+- Members who **boosted** a group can be exempt from its default restrictions (`ChannelFull.boosts_unrestrict`; needs one extra API call per read-only group, not made). Boosting needs Premium, so unlikely for these accounts; such a group would show as `read_only`.
+- No migration needed: `leave_candidates.reason` / `status` are free TEXT (`not_selected` is a new status value, `view_only` a new reason).
+- Deploy order is safe either way: the Worker passes `scope` only on leave dispatches, and `leave.yml` defaults it to `all`.
 
 ## Live Verification Log
 

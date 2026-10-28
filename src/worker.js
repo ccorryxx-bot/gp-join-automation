@@ -121,6 +121,39 @@ async function armDispatchPacingDelay(env, account, delayMs = randomDispatchDela
 const LEAVE_SCAN_RUNNING_TTL_SECONDS = 10 * 60; // scan-phase safety cap
 const LEAVE_EXEC_RUNNING_TTL_SECONDS = 20 * 60; // leave-phase safety cap (matches leave.yml timeout-minutes)
 
+// Phase 18 (2026-10-28): leave candidates come in 5 reasons and the admin has
+// two ways to confirm. The scope decides which candidates a button may leave;
+// scripts/leave_groups.py re-verifies each group's CURRENT state against the
+// same scope (its LEAVE_SCOPES: "yes" here == "all" there) right before
+// leaving, so a stale row can never widen what a tap does.
+//   yes - the original "Yes, Leave". Callback value kept as "yes" so scan
+//         messages already sitting in the admin's chat keep working. It does
+//         NOT include view_only (view-only channels with 50+ members): those
+//         were never offered before, so an old habit of tapping "Yes" must not
+//         start dropping them.
+//   rvp - "read-only + view-only + paid": every view-only channel whatever its
+//         size, plus read-only and paid-message groups. Never muted.
+const LEAVE_REASONS = ["muted", "read_only", "paid_messages", "under_50_members", "view_only"];
+const LEAVE_SCOPES = {
+  yes: ["muted", "read_only", "paid_messages", "under_50_members"],
+  rvp: ["read_only", "paid_messages", "view_only", "under_50_members"],
+};
+// Unknown / missing reason -> "muted": the DB column's own DEFAULT for
+// pre-Phase-9 rows. Applied once when a scan is stored, so what is stored,
+// listed and matched against a scope can never disagree.
+const normalizeLeaveReason = (r) => (LEAVE_REASONS.includes(r) ? r : "muted");
+// Telegram rejects a message over 4096 chars -- and a rejected scan message
+// would leave the scan stuck 'awaiting_confirm' with no buttons ever shown.
+const TELEGRAM_SAFE_MESSAGE_CHARS = 3800;
+
+// D1 batches are all-or-nothing and have size limits; a scan that flags every
+// view-only channel of a big account can be hundreds of rows.
+async function d1BatchInChunks(env, stmts, size = 50) {
+  for (let i = 0; i < stmts.length; i += size) {
+    await env.DB.batch(stmts.slice(i, i + size));
+  }
+}
+
 function leaveRunningKvKey(account) {
   return `leave:running:${account}`;
 }
@@ -368,7 +401,9 @@ async function triggerAccountStatus(env, account) {
 // Kept separate from dispatchNextQueuedJoinForAccount's inline fetch call
 // rather than unified into one shared helper — that function is already
 // live/tested in production; not touching it for a DRY-only change.
-async function dispatchLeaveWorkflow(env, account, mode, scanId) {
+async function dispatchLeaveWorkflow(env, account, mode, scanId, scope) {
+  const inputs = { account, mode, scan_id: String(scanId) };
+  if (scope) inputs.scope = scope; // leave.yml's `scope` input (Phase 18), leave mode only
   try {
     const res = await fetch(
       `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/leave.yml/dispatches`,
@@ -381,7 +416,7 @@ async function dispatchLeaveWorkflow(env, account, mode, scanId) {
           "User-Agent": "gp-join-automation-dispatcher",
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ ref: "main", inputs: { account, mode, scan_id: String(scanId) } }),
+        body: JSON.stringify({ ref: "main", inputs }),
       }
     );
     if (res.status === 204) return true;
@@ -529,7 +564,7 @@ async function handleLeaveCandidates(request, env) {
     return new Response("bad request", { status: 400 });
   }
   const { results } = await env.DB.prepare(
-    "SELECT peer_id, peer_type, title FROM leave_candidates WHERE scan_id = ? AND status = 'pending'"
+    "SELECT peer_id, peer_type, title, reason FROM leave_candidates WHERE scan_id = ? AND status = 'pending'"
   ).bind(scanId).all();
   return new Response(JSON.stringify({ candidates: results }), {
     status: 200,
@@ -603,7 +638,7 @@ async function handleLeaveReport(request, env) {
         `paid message groups - ${paidMessages}\n` +
         `read only groups - ${readOnly}\n` +
         `channels (view-only) - ${broadcast}` +
-        (unchecked ? `\nunchecked (Telegram error, see Actions log) - ${unchecked}` : "")
+        (unchecked ? `\nunchecked (စစ်လို့မရ/မသေချာလို့ မထိထားတာ — Actions log ကြည့်ပါ) - ${unchecked}` : "")
     );
     return new Response("OK", { status: 200 });
   }
@@ -624,26 +659,33 @@ async function handleLeaveReport(request, env) {
       return new Response("OK", { status: 200 });
     }
 
-    const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+    const candidates = (Array.isArray(body.candidates) ? body.candidates : []).map((c) => ({
+      ...c,
+      reason: normalizeLeaveReason(c.reason),
+    }));
     const totalDialogs = Number(body.total_dialogs) || 0;
+    // Phase 18: groups Telegram wouldn't let the scan judge. Never candidates;
+    // reported so the admin knows they exist instead of them silently vanishing.
+    const unchecked = Number(body.unchecked) || 0;
     const now = Date.now();
 
     if (candidates.length > 0) {
-      await env.DB.batch(
+      await d1BatchInChunks(
+        env,
         candidates.map((c) =>
           env.DB
             .prepare(
               "INSERT INTO leave_candidates (scan_id, peer_id, peer_type, title, reason, url, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)"
             )
-            .bind(scanId, String(c.peer_id), c.peer_type || "channel", c.title || "", c.reason || "muted", c.url || null, now)
+            .bind(scanId, String(c.peer_id), c.peer_type || "channel", c.title || "", c.reason, c.url || null, now)
         )
       );
     }
 
     const status = candidates.length > 0 ? "awaiting_confirm" : "done";
     // muted_count predates Phase 9 and is only ever written, never read
-    // elsewhere -- kept as the combined candidate count (muted +
-    // under_50_members) rather than adding a migration just to rename it.
+    // elsewhere -- kept as the combined candidate count rather than adding a
+    // migration just to rename it.
     await env.DB.prepare(
       "UPDATE leave_scans SET status = ?, total_dialogs = ?, muted_count = ?, updated_at = ? WHERE id = ?"
     ).bind(status, totalDialogs, candidates.length, now, scanId).run();
@@ -651,73 +693,21 @@ async function handleLeaveReport(request, env) {
     if (candidates.length === 0) {
       await notifyAdmin(
         env,
-        `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲမှာ Leave candidate မတွေ့ပါဘူး`
+        `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲမှာ Leave candidate မတွေ့ပါဘူး` +
+          (unchecked ? `\n\n${uncheckedNoteText(unchecked)}` : "")
       );
       return new Response("OK", { status: 200 });
     }
 
-    // Phase 9: candidates now come in up to 4 reasons -- split them for the
-    // admin instead of lumping everything under "muted" like before.
-    // Anything unrecognized falls back to the "muted" bucket, matching the
-    // DB column's DEFAULT 'muted' for pre-Phase-9 rows.
-    const REASON_SECTIONS = [
-      { key: "muted", emoji: "🔇", label: "Muted (admin-restricted)" },
-      { key: "read_only", emoji: "🔒", label: "Read-only (sending off for everyone)" },
-      { key: "paid_messages", emoji: "⭐", label: "Paid messages (Stars per message)" },
-      { key: "under_50_members", emoji: "👥", label: "Members 50 အောက်" },
-    ];
-    const byReason = { muted: [], read_only: [], paid_messages: [], under_50_members: [] };
-    for (const c of candidates) {
-      (byReason[c.reason] || byReason.muted).push(c);
+    // Show the actual group titles so the admin can eyeball the list before
+    // confirming; shrink the listing (never the buttons) if the message would
+    // not fit in one Telegram message.
+    let text = buildLeaveScanText(account, totalDialogs, candidates, unchecked, 8);
+    for (const limit of [3, 0]) {
+      if (text.length <= TELEGRAM_SAFE_MESSAGE_CHARS) break;
+      text = buildLeaveScanText(account, totalDialogs, candidates, unchecked, limit);
     }
-
-    // Show the actual group titles (not just a count) so the admin can eyeball
-    // the candidate list before confirming — capped per section to keep the
-    // Telegram message short even when a scan flags a large batch at once.
-    const MAX_LISTED_PER_SECTION = 10;
-    const MAX_TITLE_LENGTH = 60;
-    const formatSection = (list) => {
-      const lines = list
-        .slice(0, MAX_LISTED_PER_SECTION)
-        .map((c, i) => {
-          let note = "";
-          if (c.reason === "under_50_members" && c.member_count != null) note = ` (${c.member_count} members)`;
-          else if (c.reason === "paid_messages" && c.stars_price != null) note = ` (${c.stars_price}⭐/msg)`;
-          else if (c.reason === "muted" && c.muted_until) note = ` (ယာယီ mute — ${String(c.muted_until).slice(0, 10)} အထိ)`;
-          return `${i + 1}. ${(c.title || "(no title)").slice(0, MAX_TITLE_LENGTH)}${note}`;
-        })
-        .join("\n");
-      const more = list.length > MAX_LISTED_PER_SECTION
-        ? `\n...နောက်ထပ် ${list.length - MAX_LISTED_PER_SECTION} ခု`
-        : "";
-      return lines + more;
-    };
-
-    const sections = REASON_SECTIONS
-      .filter((s) => byReason[s.key].length > 0)
-      .map((s) => `\n\n${s.emoji} ${s.label} — ${byReason[s.key].length} ခု တွေ့တယ်။\n${formatSection(byReason[s.key])}`)
-      .join("");
-
-    // Phase 12 (2026-09-28): only shown when there's something to extract —
-    // a scan with zero muted candidates (e.g. only read_only/paid_messages/
-    // under_50_members hits) has nothing for the button to do.
-    const extractRow = byReason.muted.length > 0
-      ? [[{ text: "🔗 Extract muted group urls", callback_data: `extracturls:${account}:${scanId}` }]]
-      : [];
-
-    await notifyAdmin(
-      env,
-      `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက Leave candidate ${candidates.length} ခု တွေ့ပါတယ်။${sections}\n\nYes ဆို အမျိုးအစားအားလုံး တစ်ခါထဲ Leave မယ် — Confirm ပါ 👇`,
-      {
-        inline_keyboard: [
-          ...extractRow,
-          [
-            { text: "✅ Yes, Leave", callback_data: `leaveconfirm:${account}:${scanId}:yes` },
-            { text: "❌ No, Cancel", callback_data: `leaveconfirm:${account}:${scanId}:no` },
-          ],
-        ],
-      }
-    );
+    await notifyAdmin(env, text, buildLeaveScanKeyboard(account, scanId, candidates));
     return new Response("OK", { status: 200 });
   }
 
@@ -726,7 +716,8 @@ async function handleLeaveReport(request, env) {
     const now = Date.now();
 
     if (results.length > 0) {
-      await env.DB.batch(
+      await d1BatchInChunks(
+        env,
         results.map((r) =>
           env.DB
             .prepare(
@@ -749,18 +740,106 @@ async function handleLeaveReport(request, env) {
     const remaining = await env.DB.prepare(
       "SELECT COUNT(*) AS c FROM leave_candidates WHERE scan_id = ? AND status = 'pending'"
     ).bind(scanId).first();
+    // Phase 18: no cron any more, so "next cycle" was wrong. Whatever was not
+    // reached (peer-flood, a FloodWait too long to wait out, or the run's time
+    // budget) simply stays pending; a fresh /leavescan finds it again.
     const remainingNote = remaining?.c
-      ? `\n⏭️ ${remaining.c} ခု ကျန်နေပါတယ် (peer-flood ကြောင့် early-stop ဖြစ်လို့) — နောက် ၃ရက် cycle မှာ ပြန်စမှာပါ`
+      ? `\n⏭️ ${remaining.c} ခု ကျန်နေပါတယ် (Telegram rate-limit / အချိန်ကန့်သတ်ချက်ကြောင့် ရပ်လိုက်လို့) — ခဏနေပြီး /leavescan ပြန်လုပ်ပါ`
+      : "";
+    // Candidates outside the tapped button's scope (e.g. muted ones after the
+    // "read-only + view-only + paid" button) were deliberately not touched.
+    const notSelected = await env.DB.prepare(
+      "SELECT COUNT(*) AS c FROM leave_candidates WHERE scan_id = ? AND status = 'not_selected'"
+    ).bind(scanId).first();
+    const notSelectedNote = notSelected?.c
+      ? `\nℹ️ ${notSelected.c} ခုက ရွေးထားတဲ့ option ထဲမပါလို့ မထိဘဲ ချန်ထားပါတယ်`
       : "";
 
     await notifyAdmin(
       env,
-      `✅ [${account}] Groups leaving ပြီးသွားပါပြီ — ${leftCount} ခု ထွက်ပြီး, ${skippedCount} ခု ကျော် (Leave မလုပ်ခင် ပြန်စစ်တော့ အခြေအနေ ပြောင်းသွားလို့), ${failedCount} ခု fail (Auto-join ပြန်စပါပြီ)${remainingNote}`
+      `✅ [${account}] Groups leaving ပြီးသွားပါပြီ — ${leftCount} ခု ထွက်ပြီး, ${skippedCount} ခု ကျော် (Leave မလုပ်ခင် ပြန်စစ်တော့ အခြေအနေ ပြောင်းသွားလို့), ${failedCount} ခု fail (Auto-join ပြန်စပါပြီ)${remainingNote}${notSelectedNote}`
     );
     return new Response("OK", { status: 200 });
   }
 
   return new Response("bad request", { status: 400 });
+}
+
+// Phase 18 -- scan-result message. One list drives everything: sections, counts
+// and the two scoped buttons, so what is shown is what a button will touch.
+const REASON_SECTIONS = [
+  { key: "muted", emoji: "🔇", label: "Muted (admin-restricted)" },
+  { key: "read_only", emoji: "🔒", label: "Read-only (sending off for everyone)" },
+  { key: "paid_messages", emoji: "⭐", label: "Paid messages (Stars per message)" },
+  { key: "under_50_members", emoji: "👥", label: "View-only channels · Members 50 အောက်" },
+  { key: "view_only", emoji: "📺", label: "View-only channels · Members 50+" },
+];
+
+function uncheckedNoteText(n) {
+  return `⚠️ Group ${n} ခုကို Telegram က အတည်မပြုပေးလို့ (သို့) permission မသေချာလို့ မထိဘဲ ချန်ထားပါတယ် — Leave မလုပ်ပါဘူး`;
+}
+
+function leaveScopeCount(candidates, scope) {
+  const allowed = LEAVE_SCOPES[scope];
+  return candidates.filter((c) => allowed.includes(normalizeLeaveReason(c.reason))).length;
+}
+
+function buildLeaveScanText(account, totalDialogs, candidates, unchecked, listLimit) {
+  const MAX_TITLE_LENGTH = 60;
+  const byReason = Object.fromEntries(REASON_SECTIONS.map((x) => [x.key, []]));
+  for (const c of candidates) byReason[normalizeLeaveReason(c.reason)].push(c);
+
+  const formatSection = (list) => {
+    if (listLimit <= 0) return "";
+    const lines = list
+      .slice(0, listLimit)
+      .map((c, i) => {
+        let note = "";
+        if ((c.reason === "under_50_members" || c.reason === "view_only") && c.member_count != null) note = ` (${c.member_count} members)`;
+        else if (c.reason === "paid_messages" && c.stars_price != null) note = ` (${c.stars_price}⭐/msg)`;
+        else if (c.reason === "muted" && c.muted_until) note = ` (ယာယီ mute — ${String(c.muted_until).slice(0, 10)} အထိ)`;
+        return `${i + 1}. ${(c.title || "(no title)").slice(0, MAX_TITLE_LENGTH)}${note}`;
+      })
+      .join("\n");
+    const more = list.length > listLimit ? `\n...နောက်ထပ် ${list.length - listLimit} ခု` : "";
+    return `\n${lines}${more}`;
+  };
+
+  const sections = REASON_SECTIONS
+    .filter((x) => byReason[x.key].length > 0)
+    .map((x) => `\n\n${x.emoji} ${x.label} — ${byReason[x.key].length} ခု${formatSection(byReason[x.key])}`)
+    .join("");
+
+  const nYes = leaveScopeCount(candidates, "yes");
+  const nRvp = leaveScopeCount(candidates, "rvp");
+  const help = ["👇 ရွေးပါ —"];
+  if (nRvp > 0) help.push("🚪 read-only + view-only + paid → 🔒 ⭐ 📺 👥 ပဲ ထွက်မယ် (🔇 muted မထွက်ဘူး)");
+  if (nYes > 0) help.push("✅ Yes, Leave → 🔇 🔒 ⭐ 👥 ထွက်မယ် (📺 50+ view-only channel မထွက်ဘူး)");
+  help.push("Leave မလုပ်ခင် group တစ်ခုချင်းကို Telegram ပေါ်မှာ အခြေအနေ ပြန်စစ်ပါမယ် — active (post လို့ရတဲ့) group ကို ဘယ်တော့မှ မထွက်ပါဘူး");
+
+  return (
+    `🔍 [${account}] Scan ပြီးပါပြီ — Group ${totalDialogs} ခုထဲက Leave candidate ${candidates.length} ခု တွေ့ပါတယ်။` +
+    sections +
+    (unchecked ? `\n\n${uncheckedNoteText(unchecked)}` : "") +
+    `\n\n${help.join("\n")}`
+  );
+}
+
+function buildLeaveScanKeyboard(account, scanId, candidates) {
+  const nYes = leaveScopeCount(candidates, "yes");
+  const nRvp = leaveScopeCount(candidates, "rvp");
+  // Extract is always offered (Phase 18). It used to appear only when a MUTED
+  // candidate existed, so accounts whose candidates were read-only/paid/
+  // view-only never got it.
+  const rows = [[{ text: "🔗 Extract group urls", callback_data: `extracturls:${account}:${scanId}` }]];
+  if (nRvp > 0) {
+    rows.push([{ text: `🚪 Leave read-only + view-only + paid (${nRvp})`, callback_data: `leaveconfirm:${account}:${scanId}:rvp` }]);
+  }
+  const decide = [];
+  if (nYes > 0) decide.push({ text: `✅ Yes, Leave (${nYes})`, callback_data: `leaveconfirm:${account}:${scanId}:yes` });
+  decide.push({ text: "❌ No, Cancel", callback_data: `leaveconfirm:${account}:${scanId}:no` });
+  rows.push(decide);
+  return { inline_keyboard: rows };
 }
 
 // Phase 8's system notices (scan result, leave-started, leave-finished) go
@@ -1219,14 +1298,48 @@ async function handleCallbackQuery(env, cq) {
   }
 }
 
-// Phase 12 (2026-09-28): "🔗 Extract muted group urls" button on the
-// scan-result message. Read-only — no GitHub Action, no Telethon session,
-// no API call to Telegram at all. Every candidate's url (or lack of one)
-// was already captured for free during the scan itself (see
-// scan_leave_candidates()'s comment in scripts/leave_groups.py) and stored
-// in leave_candidates.url, so this is a plain D1 read. Sent as a separate
-// message rather than editing the scan-result one, so the Yes/No confirm
-// buttons on that message stay intact and tappable afterward.
+// Phase 12 (2026-09-28), widened in Phase 18: "🔗 Extract group urls" button on
+// the scan-result message. Read-only -- no GitHub Action, no Telethon session,
+// no API call to Telegram at all. Every candidate's url (or lack of one) was
+// already captured for free during the scan itself (see scan_leave_candidates()
+// in scripts/leave_groups.py) and stored in leave_candidates.url, so this is a
+// plain D1 read. Before Phase 18 it listed MUTED candidates only and the button
+// was only shown when one existed, so an account whose candidates were
+// read-only / paid / view-only had no way to get its urls. Now every candidate
+// is listed, grouped by reason (muted first). Sent as separate message(s) --
+// split to stay under Telegram's 4096-char limit -- so the buttons on the scan
+// message stay intact and tappable afterward.
+function buildExtractUrlMessages(account, rows, maxChars = TELEGRAM_SAFE_MESSAGE_CHARS) {
+  const withUrlTotal = rows.filter((r) => r.url).length;
+  const lines = [`🔗 [${account}] Group urls — ${rows.length} ခုထဲက ${withUrlTotal} ခု url ရပါတယ်`];
+  for (const sec of REASON_SECTIONS) {
+    const list = rows.filter((r) => normalizeLeaveReason(r.reason) === sec.key);
+    if (list.length === 0) continue;
+    const withUrl = list.filter((r) => r.url);
+    const withoutUrl = list.filter((r) => !r.url);
+    lines.push("", `${sec.emoji} ${sec.label} — ${list.length} ခု (${withUrl.length} url)`);
+    withUrl.forEach((r, i) => lines.push(`${i + 1}. ${r.url}`));
+    if (withoutUrl.length > 0) {
+      lines.push(
+        `⚠️ Private/invite-only ${withoutUrl.length} ခု — url မရနိုင်ပါ (username မရှိလို့, join ဖို့ invite link ကိုယ်တိုင်ရှာရပါလိမ့်မယ်):`
+      );
+      withoutUrl.forEach((r, i) => lines.push(`${i + 1}. ${(r.title || "(no title)").slice(0, 60)}`));
+    }
+  }
+  const messages = [];
+  let cur = "";
+  for (const line of lines) {
+    if (cur && cur.length + line.length + 1 > maxChars) {
+      messages.push(cur);
+      cur = line;
+    } else {
+      cur = cur ? `${cur}\n${line}` : line;
+    }
+  }
+  if (cur) messages.push(cur);
+  return messages;
+}
+
 async function handleExtractUrlsCallback(env, cq, data, chatId) {
   const [, account, scanIdRaw] = data.split(":");
   const scanId = Number(scanIdRaw);
@@ -1235,39 +1348,33 @@ async function handleExtractUrlsCallback(env, cq, data, chatId) {
     return;
   }
 
+  // Every status, not just 'pending': the urls stay useful after a leave run.
   const { results } = await env.DB.prepare(
-    "SELECT title, url FROM leave_candidates WHERE scan_id = ? AND reason = 'muted' ORDER BY id"
+    "SELECT reason, title, url FROM leave_candidates WHERE scan_id = ? ORDER BY id"
   ).bind(scanId).all();
 
   await answerCallbackQuery(env, cq.id);
 
   if (results.length === 0) {
-    await replyToUser(env, chatId, `🔗 [${account}] Muted candidate မရှိတော့ပါဘူး (scan ဟောင်းသွားပြီလား?)`);
+    await replyToUser(env, chatId, `🔗 [${account}] Candidate မရှိတော့ပါဘူး (scan ဟောင်းသွားပြီလား?)`);
     return;
   }
 
-  const withUrl = results.filter((r) => r.url);
-  const withoutUrl = results.filter((r) => !r.url);
-
-  const lines = [`🔗 [${account}] Muted group urls — ${results.length} ခုထဲက ${withUrl.length} ခု url ရပါတယ်:`];
-  if (withUrl.length > 0) {
-    lines.push("", ...withUrl.map((r, i) => `${i + 1}. ${r.url}`));
+  for (const message of buildExtractUrlMessages(account, results)) {
+    await replyToUser(env, chatId, message);
   }
-  if (withoutUrl.length > 0) {
-    lines.push(
-      "",
-      `⚠️ Private/invite-only group ${withoutUrl.length} ခု — url မရနိုင်ပါ (username မရှိလို့, join ဖို့ invite link ကိုယ်တိုင်ရှာရပါလိမ့်မယ်):`,
-      ...withoutUrl.map((r, i) => `${i + 1}. ${r.title || "(no title)"}`)
-    );
-  }
-
-  await replyToUser(env, chatId, lines.join("\n"));
 }
 
-// Phase 8: admin tapped Yes/No on the leave-confirm prompt sent from
-// handleLeaveReport. Idempotent against double-taps via the scan's status
-// column — a second tap on an already-actioned prompt is a no-op, not a
-// second dispatch.
+// Phase 8: admin tapped a confirm button on the scan-result message. Idempotent
+// against double-taps via the scan's status column — a second tap on an
+// already-actioned prompt is a no-op, not a second dispatch.
+//   :no  - cancel
+//   :yes - the original "Yes, Leave" (scope LEAVE_SCOPES.yes)
+//   :rvp - Phase 18 "read-only + view-only + paid" (scope LEAVE_SCOPES.rvp)
+// For yes/rvp the pending set is narrowed to the scope BEFORE dispatch:
+// candidates outside it become 'not_selected', so /leave-candidates (which
+// returns only 'pending') hands the Python run exactly what was chosen. No
+// schema change: leave_candidates.status is free TEXT.
 async function handleLeaveConfirmCallback(env, cq, data, chatId, messageId) {
   const [, account, scanIdRaw, choice] = data.split(":");
   const scanId = Number(scanIdRaw);
@@ -1292,17 +1399,35 @@ async function handleLeaveConfirmCallback(env, cq, data, chatId, messageId) {
     return;
   }
 
-  if (choice === "yes") {
+  if (choice === "yes" || choice === "rvp") {
+    const reasons = LEAVE_SCOPES[choice];
+    const placeholders = reasons.map(() => "?").join(",");
+
+    const inScope = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM leave_candidates WHERE scan_id = ? AND status = 'pending' AND reason IN (${placeholders})`
+    ).bind(scanId, ...reasons).first();
+    if (!inScope?.c) {
+      await answerCallbackQuery(env, cq.id, "⚠️ ဒီ option နဲ့ ထွက်ရမယ့် group မရှိပါဘူး", true);
+      return;
+    }
+
+    await env.DB.prepare(
+      `UPDATE leave_candidates SET status = 'not_selected', updated_at = ? WHERE scan_id = ? AND status = 'pending' AND reason NOT IN (${placeholders})`
+    ).bind(Date.now(), scanId, ...reasons).run();
+
     await env.DEDUP_KV.put(leaveRunningKvKey(account), "1", {
       expirationTtl: LEAVE_EXEC_RUNNING_TTL_SECONDS,
     });
     await env.DB.prepare("UPDATE leave_scans SET status = 'leaving', updated_at = ? WHERE id = ?")
       .bind(Date.now(), scanId).run();
 
-    const ok = await dispatchLeaveWorkflow(env, account, "leave", scanId);
+    const ok = await dispatchLeaveWorkflow(env, account, "leave", scanId, choice === "rvp" ? "rvp" : "all");
     if (!ok) {
-      // Roll back so the admin can just tap the button again.
+      // Roll everything back so the admin can just tap a button again.
       await env.DEDUP_KV.delete(leaveRunningKvKey(account));
+      await env.DB.prepare(
+        "UPDATE leave_candidates SET status = 'pending', updated_at = ? WHERE scan_id = ? AND status = 'not_selected'"
+      ).bind(Date.now(), scanId).run();
       await env.DB.prepare("UPDATE leave_scans SET status = 'awaiting_confirm', updated_at = ? WHERE id = ?")
         .bind(Date.now(), scanId).run();
       await answerCallbackQuery(env, cq.id, "⚠️ Dispatch မအောင်မြင်ပါ — ပြန်နှိပ်ကြည့်ပါ", true);
@@ -1311,14 +1436,18 @@ async function handleLeaveConfirmCallback(env, cq, data, chatId, messageId) {
 
     await answerCallbackQuery(env, cq.id, `✅ ${account} leaving စပါပြီ`);
     if (messageId) {
+      const what = choice === "rvp" ? "read-only + view-only + paid" : "Yes, Leave";
       await editMessageText(
         env,
         chatId,
         messageId,
-        `🚪 [${account}] Groups leaving စတင်ပါပြီ — auto-join ကို ခေတ္တ ရပ်ထားပါမယ် (~10-15 min)`
+        `🚪 [${account}] Groups leaving စတင်ပါပြီ (${what} — ${inScope.c} ခု) — auto-join ကို ခေတ္တ ရပ်ထားပါမယ် (~10-15 min)`
       );
     }
+    return;
   }
+
+  await answerCallbackQuery(env, cq.id, "⚠️ မသိတဲ့ option", true);
 }
 
 // Single source of truth for every admin command. /help text AND the

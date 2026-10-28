@@ -26,6 +26,14 @@ on:
         description: "leave_scans.id this run belongs to (set by the Worker)"
         required: true
         type: string
+      scope:
+        description: "leave mode only (set by the Worker): all = muted/read-only/paid/<50 (original Yes), rvp = read-only + view-only channels + paid (never muted)"
+        required: false
+        type: choice
+        options:
+          - all
+          - rvp
+        default: all
 
 # Phase 8 (2026-09-23): deliberately the SAME group as join.yml, not a
 # separate "telegram-leave-*" one. GitHub's concurrency scope is repo-wide,
@@ -78,6 +86,7 @@ jobs:
           ACCOUNT: ${{ inputs.account }}
           MODE: ${{ inputs.mode }}
           SCAN_ID: ${{ inputs.scan_id }}
+          SCOPE: ${{ inputs.scope }}
           REPORT_URL: ${{ secrets.WORKER_REPORT_URL }}
           REPORT_SECRET: ${{ secrets.REPORT_SECRET }}
         run: python scripts/leave_groups.py
